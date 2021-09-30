@@ -1,0 +1,149 @@
+* fuse-overlayfs-1.7.1
+
+- set FUSE_CAP_POSIX_ACL only when it is supported by FUSE.
+- treat statx failure with EINVAL as ENOSYS, so that the fallback
+  is attempted.
+
+* fuse-overlayfs-1.7
+
+- fix read xattrs for device files
+- don't create whiteout files in opaque dirs.
+- fix reading files when running with euid != 0.
+- enable POSIX ACLs.
+
+* fuse-overlayfs-1.6
+
+- fix an invalid access when filtering internal xattrs that could
+  deal to a segfault.
+
+* fuse-overlayfs-1.5
+
+- honor FUSE_OVERLAYFS_DISABLE_OVL_WHITEOUT also for renames
+- use strncpy instead of strcpy
+- fix renameat2(RENAME_NOREPLACE) on older kernels that lack
+  device whiteouts for unprivileged users.
+- fix creating a symlink on top of a removed file.
+- fix copyup of xattrs longer than 256 bytes.
+
+* fuse-overlayfs-1.4
+
+- add squash_to_uid and squash_to_gid
+
+* fuse-overlayfs-1.3
+
+- add squash_to_root mount option.
+- honor option "volatile".
+- when writing mode to xattr, create files with mode 0755.
+- support ID mapping when using xattr permissions.
+- allow opening not accessible but still referenced files.
+- invalidate directory cache on create/rename.
+
+* fuse-overlayfs-1.2
+
+- fix segfault if no mountpoint specified
+- fix file_exists_at musl compatibility
+- introduce extended attribute to override gid/uid/mode.
+- support writing uid/gid/mode to an extended attribute.
+- fix a memory leak, where inodes are maintained in memory even if not needed.
+
+* fuse-overlayfs-1.1.2
+
+- fix build issues with libmusl.
+- fix memory leak when creating whiteout files.
+
+* fuse-overlayfs-1.1.1
+
+- fix lookup for overflow uid when it is different than the overflow gid.
+
+* fuse-overlayfs-1.1.0
+
+- use openat2(2) when available.
+- accept "ro" as mount option.
+- fix set mtime for a symlink.
+- fix some issues reported by static analysis.
+- fix potential infinite loop on a short read.
+- fix creating a directory if the destination already exists in the upper layer.
+
+* fuse-overlayfs-1.0.0
+
+- fix portability issue to 32 bits archs.
+
+* fuse-overlayfs-0.7.8
+
+- report correctly the number of links for a directory also for subsequent stat calls.
+- stop looking up the ino in the lower layers if the file could not be opened.
+
+* fuse-overlayfs-0.7.7
+
+- make sure the destination is deleted before doing a rename(2).  It prevents a left
+  over directory to cause delete to fail with EEXIST.
+- honor --debug.
+
+* fuse-overlayfs-0.7.6
+
+- do not look in lower layers for the ino if there is no origin xattr set.
+- attempt to use the file path if the operation on the fd fails with ENXIO.
+
+* fuse-overlayfs-0.7.5
+
+- do not expose internal xattrs through listxattr and getxattr.
+
+* fuse-overlayfs-0.7.4
+
+- fix fallocate for deleted files.
+- ignore O_DIRECT.  It causes issues with libfuse not using an aligned buffer, causing
+  write(2) to fail with EINVAL.
+- on copyup, do not copy the opaque xattr.
+- fix a wrong lookup for whiteout files, that could happen on a double unlink.
+
+* fuse-overlayfs-0.7.3
+
+- fix build with -fno-common
+- fix possible segmentation fault in direct_fsync()
+- use the data store to create missing whiteouts.
+- after a rename, force a directory reload.
+
+* fuse-overlayfs-0.7.2
+
+- drop special handling for security.capability.
+
+* fuse-overlayfs-0.7.1
+
+- fix an issue where a whiteout in the parent directory could hide
+  files in the sub directories.
+
+* fuse-overlayfs-0.7
+
+- plugins support.  It allows to read the lower layers from a different data source.
+- support running without an upper layer in read only mode.
+- honor opaque whiteouts.
+
+* fuse-overlayfs-0.6.5
+
+- stat reports correctly the number of links for a directory.
+
+* fuse-overlayfs-0.6.4
+
+- do not lose the setuid bit after a write when the writeback cache is used.
+- skip creating a whiteout if the node is present only on the upper layer.
+
+* fuse-overlayfs-0.6.3
+
+- correctly delete an existing whiteout when the file is recreated (regression introduced with 0.5).
+- fix ioctl on directories.
+
+* fuse-overlayfs-0.6.2
+
+- avoid ino lookup if not necessary.
+- include st_dev in the hash key.  Now the same inode number can be safely used by lower
+  directories on different file systems.
+
+* fuse-overlayfs-0.6.1
+
+- fix a regression introduced with 0.6 where UNIX sockets could not be correctly created.
+
+* fuse-overlayfs-0.6
+
+- fix an issue where changes to an inode would not be visible from another hard link.
+  The issue was always present but was made easier to reproduce with fuse-overlayfs 0.5
+  that enables FUSE writeback by default.
