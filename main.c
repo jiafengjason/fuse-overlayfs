@@ -73,8 +73,32 @@
        __result; }))
 #endif
 
+struct fuse_req {
+	struct fuse_session *se;
+	uint64_t unique;
+	int ctr;
+	pthread_mutex_t lock;
+	struct fuse_ctx ctx;
+	struct fuse_chan *ch;
+	int interrupted;
+	unsigned int ioctl_64bit : 1;
+	union {
+		struct {
+			uint64_t unique;
+		} i;
+		struct {
+			fuse_interrupt_func_t func;
+			void *data;
+		} ni;
+	} u;
+	struct fuse_req *next;
+	struct fuse_req *prev;
+};
+
 static bool disable_locking;
 static pthread_mutex_t lock;
+char hostpid[64];
+bool isBoxRunning=false;
 
 static int
 enter_big_lock ()
@@ -171,13 +195,20 @@ struct stats_s
 
 static volatile struct stats_s stats;
 
-static void
-print_stats (int sig)
+void SIGUSR1_handle(int sig)
 {
+  fprintf (stderr, "Reveice SIGUSR1 signal %d \n", sig);
+  isBoxRunning = false;
   char fmt[128];
   int l = snprintf (fmt, sizeof (fmt) - 1, "# INODES: %zu\n# NODES: %zu\n", stats.inodes, stats.nodes);
   fmt[l] = '\0';
-  (void) write (STDERR_FILENO, fmt, l + 1);
+  write (STDERR_FILENO, fmt, l + 1);
+}
+
+void SIGUSR2_handle(int sig)
+{
+    fprintf (stderr, "Reveice SIGUSR2 signal %d \n", sig);
+    isBoxRunning = true;
 }
 
 static double
@@ -832,6 +863,211 @@ delete_whiteout (struct ovl_data *lo, int dirfd, struct ovl_node *parent, const 
   return 0;
 }
 
+int getParentPid(int pid, int *decision)
+{
+    char dir[1024]={0};
+    char statPath[1024] = {0};
+    char buf[1024] = {0};
+    int rpid=0;
+    int fpid=0;
+    char fpath[1024]={0};
+    struct stat st;
+    ssize_t ret =0;
+
+    sprintf(dir,"/proc/%d/",pid);
+
+    sprintf(statPath,"%sstat",dir);
+
+    if(stat(statPath,&st)!=0)
+    {
+        return -2; 
+    }
+
+    memset(buf,0,strlen(buf));
+
+    FILE * fp = fopen(statPath,"r");
+
+    ret += fread(buf + ret,1,300-ret,fp);
+
+    fclose(fp);
+
+    sscanf(buf,"%*d %*c%s %*c %d %*s",fpath,&fpid);
+
+    fpath[strlen(fpath)-1]='\0';
+    
+    if(strncmp(fpath, "firejail", strlen("firejail"))==0
+       || strncmp(fpath, "encfs", strlen("encfs"))==0
+       || strncmp(fpath, "fuse-overlayfs", strlen("fuse-overlayfs"))==0)
+    {
+        *decision=1;
+    }
+    
+    if(strcmp(fpath,"bash")!=0 && strcmp(fpath,"sudo")!=0 ) //bash 终端 sudo 终端
+    {
+        if(fpid==1)
+        {
+            *decision=0;
+            return pid;
+        }
+        else if(fpid==2)
+        {
+            *decision=0;
+            return -1; //内核线程
+        }
+        rpid = getParentPid(fpid, decision);
+        if(rpid == 0)
+        {
+            rpid = pid;
+        }
+    }
+
+    return rpid;
+}
+
+/*判断当前访问进程是在host还是guest
+static int checkSandbox(int pid_guest) {
+    //int decision = 0;
+    char guestpid[64];
+    char path[64];
+    int pid;
+    int len;
+
+    if (hostpid[0] == 0)
+    {
+        pid = getpid();
+        snprintf(path, sizeof(path), "/proc/%d/ns/pid", pid);
+        if ((len = readlink(path, hostpid, sizeof(hostpid)-1)) != -1)
+        {
+            hostpid[len] = '\0';
+        }
+    }
+
+    snprintf(path, sizeof(path), "/proc/%d/ns/pid", pid_guest);
+    if ((len = readlink(path, guestpid, sizeof(guestpid)-1)) != -1)
+    {
+        guestpid[len] = '\0';
+    }
+
+    //box外面
+    if (strcmp(guestpid, hostpid) == 0) {
+        return 1;
+    }
+    //box里面
+    else{
+        return 1;
+    }
+    //getParentPid(pid, &decision);
+
+    //return decision;
+}
+*/
+
+static int checkSandbox(int pid_guest) 
+{
+    return 1;
+}
+
+static int checkPath(struct ovl_data *lo, char *path) 
+{
+    char *dirc;
+    char *dname;
+
+    dirc = strdup(lo->mountpoint);
+    dname = dirname(dirc);
+
+    if (0 == strncmp(path, dname+1, strlen(dname+1))) {
+        fprintf(stderr, "CheckPath deny, path=%s\n", path);
+        return 0;
+    }
+    else
+    {
+        return 1;
+    }  
+}
+
+static int checkAccess(fuse_req_t req, struct ovl_data *lo, char *nodePath) {
+    char guestpid[64];
+    char path[64];
+    int pid;
+    int len;
+    //FILE *fp;
+    //char buf[PIPE_BUF];
+    //char command[150];
+    //int count;
+
+    if (UNLIKELY (ovl_debug (req)))
+    {
+        fprintf(stderr, "checkAccess path=%s\n", nodePath);
+    }
+
+    if (hostpid[0] == 0)
+    {
+        pid = getpid();
+        snprintf(path, sizeof(path), "/proc/%d/ns/pid", pid);
+        if ((len = readlink(path, hostpid, sizeof(hostpid)-1)) != -1)
+        {
+            hostpid[len] = '\0';
+        }
+    }
+
+    snprintf(path, sizeof(path), "/proc/%d/ns/pid", req->ctx.pid);
+    if ((len = readlink(path, guestpid, sizeof(guestpid)-1)) != -1)
+    {
+        guestpid[len] = '\0';
+    }
+
+    //box外面
+    if (strcmp(guestpid, hostpid) == 0) {
+        if(isBoxRunning)
+        {
+            return 0;
+        }
+        else
+        {
+            return 1;
+        }
+        /*
+        sprintf(command, "ps -ef |grep firejail | grep -v grep | wc -l");
+        
+        if((fp=popen(command, "r"))==NULL)
+        {
+            return 1;
+        }
+
+        if((fgets(buf, PIPE_BUF, fp))==NULL)
+        {
+            pclose(fp);
+            return 1;
+        }
+
+        count=atoi(buf);
+        if(count>0)
+        {
+            pclose(fp);
+            return 0;
+        }
+        else
+        {
+            pclose(fp);
+            return 1;
+        }
+        */
+
+        /*
+        if (UNLIKELY (ovl_debug (req)))
+        {
+            fprintf(stderr, "checkAccess strcmp same\n");
+        }
+
+
+        */
+    }
+    //box里面
+    else{
+        return checkPath(lo, nodePath);
+    }
+}
+
 static unsigned int
 find_mapping (unsigned int id, const struct ovl_data *data,
               bool direct, bool uid)
@@ -1281,6 +1517,10 @@ ovl_forget (fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
   cleanup_lock int l = enter_big_lock ();
   struct ovl_data *lo = ovl_data (req);
 
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_forget(ino=%" PRIu64 ", nlookup=%lu)\n",
 	     ino, nlookup);
@@ -1298,6 +1538,11 @@ ovl_forget_multi (fuse_req_t req, size_t count, struct fuse_forget_data *forgets
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_forget_multi(count=%zu, forgets=%p)\n",
 	     count, forgets);
+
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
 
   for (i = 0; i < count; i++)
     do_forget (lo, forgets[i].ino, forgets[i].nlookup);
@@ -1665,6 +1910,11 @@ load_dir (struct ovl_data *lo, struct ovl_node *n, struct ovl_layer *layer, char
       if (ret == 0)
         break;
 
+      if (checkPath(lo, path)==0)
+      {
+          continue;
+      }
+
       dp = it->ds->opendir (it, path);
       if (dp == NULL)
         continue;
@@ -1969,7 +2219,7 @@ read_dirs (struct ovl_data *lo, char *path, bool low, struct ovl_layer *layers)
 }
 
 static struct ovl_node *
-do_lookup_file (struct ovl_data *lo, fuse_ino_t parent, const char *name)
+do_lookup_file (fuse_req_t req, struct ovl_data *lo, fuse_ino_t parent, const char *name)
 {
   struct ovl_node key;
   struct ovl_node *node, *pnode;
@@ -1978,6 +2228,10 @@ do_lookup_file (struct ovl_data *lo, fuse_ino_t parent, const char *name)
     pnode = lo->root;
   else
     pnode = inode_to_node (lo, parent);
+  
+  if (0 == checkAccess(req, lo, pnode->path)) {
+    return NULL;
+  }
 
   if (name == NULL)
     return pnode;
@@ -2108,9 +2362,13 @@ ovl_lookup (fuse_req_t req, fuse_ino_t parent, const char *name)
     fprintf (stderr, "ovl_lookup(parent=%" PRIu64 ", name=%s)\n",
 	     parent, name);
 
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
   memset (&e, 0, sizeof (e));
 
-  node = do_lookup_file (lo, parent, name);
+  node = do_lookup_file (req, lo, parent, name);
   if (node == NULL || node->whiteout)
     {
       e.ino = 0;
@@ -2206,13 +2464,18 @@ ovl_opendir (fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_opendir(ino=%" PRIu64 ")\n", ino);
 
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
+
   if (d == NULL)
     {
       errno = ENOMEM;
       goto out_errno;
     }
 
-  node = do_lookup_file (lo, ino, NULL);
+  node = do_lookup_file (req, lo, ino, NULL);
   if (node == NULL)
     {
       errno = ENOENT;
@@ -2379,6 +2642,10 @@ ovl_do_readdir (fuse_req_t req, fuse_ino_t ino, size_t size,
             name = node->name;
           }
 
+        if (0 == checkAccess(req, lo, node->path)) {
+          continue;
+        }
+  
         if (!plus)
           {
             /* From the 'stbuf' argument the st_ino field and bits 12-15 of the
@@ -2435,6 +2702,10 @@ ovl_readdir (fuse_req_t req, fuse_ino_t ino, size_t size,
 	    off_t offset, struct fuse_file_info *fi)
 {
   cleanup_lock int l = enter_big_lock ();
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_readdir(ino=%" PRIu64 ", size=%zu, offset=%lo)\n", ino, size, offset);
   ovl_do_readdir (req, ino, size, offset, fi, 0);
@@ -2445,6 +2716,10 @@ ovl_readdirplus (fuse_req_t req, fuse_ino_t ino, size_t size,
 		off_t offset, struct fuse_file_info *fi)
 {
   cleanup_lock int l = enter_big_lock ();
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_readdirplus(ino=%" PRIu64 ", size=%zu, offset=%lo)\n", ino, size, offset);
   ovl_do_readdir (req, ino, size, offset, fi, 1);
@@ -2462,6 +2737,10 @@ ovl_releasedir (fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_releasedir(ino=%" PRIu64 ")\n", ino);
 
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
   for (s = 2; s < d->tbl_size; s++)
     {
       d->tbl[s]->node_lookups--;
@@ -2472,7 +2751,7 @@ ovl_releasedir (fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
         }
     }
 
-  node = do_lookup_file (lo, ino, NULL);
+  node = do_lookup_file (req, lo, ino, NULL);
   if (node)
     node->in_readdir--;
 
@@ -2529,13 +2808,18 @@ ovl_listxattr (fuse_req_t req, fuse_ino_t ino, size_t size)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_listxattr(ino=%" PRIu64 ", size=%zu)\n", ino, size);
 
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
+
   if (lo->disable_xattrs)
     {
       fuse_reply_err (req, ENOSYS);
       return;
     }
 
-  node = do_lookup_file (lo, ino, NULL);
+  node = do_lookup_file (req, lo, ino, NULL);
   if (node == NULL)
     {
       fuse_reply_err (req, ENOENT);
@@ -2587,6 +2871,11 @@ ovl_getxattr (fuse_req_t req, fuse_ino_t ino, const char *name, size_t size)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_getxattr(ino=%" PRIu64 ", name=%s, size=%zu)\n", ino, name, size);
 
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
+
   if (lo->disable_xattrs)
     {
       fuse_reply_err (req, ENOSYS);
@@ -2599,7 +2888,7 @@ ovl_getxattr (fuse_req_t req, fuse_ino_t ino, const char *name, size_t size)
       return;
     }
 
-  node = do_lookup_file (lo, ino, NULL);
+  node = do_lookup_file (req, lo, ino, NULL);
   if (node == NULL || node->whiteout)
     {
       fuse_reply_err (req, ENOENT);
@@ -2644,12 +2933,16 @@ ovl_access (fuse_req_t req, fuse_ino_t ino, int mask)
 {
   cleanup_lock int l = enter_big_lock ();
   struct ovl_data *lo = ovl_data (req);
-  struct ovl_node *n = do_lookup_file (lo, ino, NULL);
+  struct ovl_node *n = do_lookup_file (req, lo, ino, NULL);
 
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_access(ino=%" PRIu64 ", mask=%d)\n",
 	     ino, mask);
 
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
   if ((mask & n->ino->mode) == mask)
     fuse_reply_err (req, 0);
   else
@@ -3230,7 +3523,7 @@ do_rm (fuse_req_t req, fuse_ino_t parent, const char *name, bool dirp)
   size_t whiteouts = 0;
   struct ovl_node key, *rm;
 
-  node = do_lookup_file (lo, parent, name);
+  node = do_lookup_file (req, lo, parent, name);
   if (node == NULL || node->whiteout)
     {
       fuse_reply_err (req, ENOENT);
@@ -3276,7 +3569,7 @@ do_rm (fuse_req_t req, fuse_ino_t parent, const char *name, bool dirp)
         }
     }
 
-  pnode = do_lookup_file (lo, parent, NULL);
+  pnode = do_lookup_file (req, lo, parent, NULL);
   if (pnode == NULL || pnode->whiteout)
     {
       fuse_reply_err (req, ENOENT);
@@ -3322,6 +3615,11 @@ static void
 ovl_unlink (fuse_req_t req, fuse_ino_t parent, const char *name)
 {
   cleanup_lock int l = enter_big_lock ();
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
+
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_unlink(parent=%" PRIu64 ", name=%s)\n",
 	     parent, name);
@@ -3332,6 +3630,11 @@ static void
 ovl_rmdir (fuse_req_t req, fuse_ino_t parent, const char *name)
 {
   cleanup_lock int l = enter_big_lock ();
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
+
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_rmdir(parent=%" PRIu64 ", name=%s)\n",
 	     parent, name);
@@ -3369,6 +3672,11 @@ ovl_setxattr (fuse_req_t req, fuse_ino_t ino, const char *name,
     fprintf (stderr, "ovl_setxattr(ino=%" PRIu64 ", name=%s, value=%s, size=%zu, flags=%d)\n", ino, name,
              value, size, flags);
 
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
+
   if (lo->disable_xattrs)
     {
       fuse_reply_err (req, ENOSYS);
@@ -3381,7 +3689,7 @@ ovl_setxattr (fuse_req_t req, fuse_ino_t ino, const char *name,
       return;
     }
 
-  node = do_lookup_file (lo, ino, NULL);
+  node = do_lookup_file (req, lo, ino, NULL);
   if (node == NULL || node->whiteout)
     {
       fuse_reply_err (req, ENOENT);
@@ -3441,7 +3749,12 @@ ovl_removexattr (fuse_req_t req, fuse_ino_t ino, const char *name)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_removexattr(ino=%" PRIu64 ", name=%s)\n", ino, name);
 
-  node = do_lookup_file (lo, ino, NULL);
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
+
+  node = do_lookup_file (req, lo, ino, NULL);
   if (node == NULL || node->whiteout)
     {
       fuse_reply_err (req, ENOENT);
@@ -3550,7 +3863,7 @@ ovl_do_open (fuse_req_t req, fuse_ino_t parent, const char *name, int flags, mod
       return - 1;
     }
 
-  n = do_lookup_file (lo, parent, name);
+  n = do_lookup_file (req, lo, parent, name);
   if (n && n->hidden)
     {
       if (retnode)
@@ -3583,7 +3896,7 @@ ovl_do_open (fuse_req_t req, fuse_ino_t parent, const char *name, int flags, mod
           return -1;
         }
 
-      p = do_lookup_file (lo, parent, NULL);
+      p = do_lookup_file (req, lo, parent, NULL);
       if (p == NULL)
         {
           errno = ENOENT;
@@ -3810,7 +4123,10 @@ ovl_create (fuse_req_t req, fuse_ino_t parent, const char *name,
       fuse_reply_err (req, ENAMETOOLONG);
       return;
     }
-
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
   fi->flags = fi->flags | O_CREAT;
 
   if (lo->xattr_permissions)
@@ -3823,7 +4139,7 @@ ovl_create (fuse_req_t req, fuse_ino_t parent, const char *name,
       return;
     }
 
-  p = do_lookup_file (lo, parent, NULL);
+  p = do_lookup_file (req, lo, parent, NULL);
   /* Make sure the cache is invalidated, if the parent is in the middle of a readdir. */
   if (p && p->in_readdir)
     fuse_lowlevel_notify_inval_inode (lo->se, parent, 0, 0);
@@ -3850,7 +4166,10 @@ ovl_open (fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_open(ino=%" PRIu64 ")\n", ino);
-
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
   fd = ovl_do_open (req, ino, NULL, fi->flags, 0700, NULL, NULL);
   if (fd < 0)
     {
@@ -3875,7 +4194,11 @@ ovl_getattr (fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_getattr(ino=%" PRIu64 ")\n", ino);
 
-  node = do_lookup_file (lo, ino, NULL);
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
+  node = do_lookup_file (req, lo, ino, NULL);
   if (node == NULL || node->whiteout)
     {
       fuse_reply_err (req, ENOENT);
@@ -3908,8 +4231,12 @@ ovl_setattr (fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to_set, stru
 
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_setattr(ino=%" PRIu64 ", to_set=%d)\n", ino, to_set);
-
-  node = do_lookup_file (lo, ino, NULL);
+  
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
+  node = do_lookup_file (req, lo, ino, NULL);
   if (node == NULL || node->whiteout)
     {
       fuse_reply_err (req, ENOENT);
@@ -4095,13 +4422,18 @@ ovl_link (fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent, const char *newn
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_link(ino=%" PRIu64 ", newparent=%" PRIu64 ", newname=%s)\n", ino, newparent, newname);
 
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
+
   if (strlen (newname) > get_fs_namemax (lo))
     {
       fuse_reply_err (req, ENAMETOOLONG);
       return;
     }
 
-  node = do_lookup_file (lo, ino, NULL);
+  node = do_lookup_file (req, lo, ino, NULL);
   if (node == NULL || node->whiteout)
     {
       fuse_reply_err (req, ENOENT);
@@ -4115,14 +4447,14 @@ ovl_link (fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent, const char *newn
       return;
     }
 
-  newparentnode = do_lookup_file (lo, newparent, NULL);
+  newparentnode = do_lookup_file (req, lo, newparent, NULL);
   if (newparentnode == NULL || newparentnode->whiteout)
     {
       fuse_reply_err (req, ENOENT);
       return;
     }
 
-  destnode = do_lookup_file (lo, newparent, newname);
+  destnode = do_lookup_file (req, lo, newparent, newname);
   if (destnode && !destnode->whiteout)
     {
       fuse_reply_err (req, EEXIST);
@@ -4239,6 +4571,11 @@ ovl_symlink (fuse_req_t req, const char *link, fuse_ino_t parent, const char *na
 
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_symlink(link=%s, ino=%" PRIu64 ", name=%s)\n", link, parent, name);
+  
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
 
   if (strlen (name) > get_fs_namemax (lo))
     {
@@ -4246,7 +4583,7 @@ ovl_symlink (fuse_req_t req, const char *link, fuse_ino_t parent, const char *na
       return;
     }
 
-  pnode = do_lookup_file (lo, parent, NULL);
+  pnode = do_lookup_file (req, lo, parent, NULL);
   if (pnode == NULL || pnode->whiteout)
     {
       fuse_reply_err (req, ENOENT);
@@ -4260,7 +4597,7 @@ ovl_symlink (fuse_req_t req, const char *link, fuse_ino_t parent, const char *na
       return;
     }
 
-  node = do_lookup_file (lo, parent, name);
+  node = do_lookup_file (req, lo, parent, name);
   if (node != NULL && !node->whiteout)
     {
       fuse_reply_err (req, EEXIST);
@@ -4334,7 +4671,7 @@ ovl_rename_exchange (fuse_req_t req, fuse_ino_t parent, const char *name,
   struct ovl_node *rm1, *rm2;
   char *tmp;
 
-  node = do_lookup_file (lo, parent, name);
+  node = do_lookup_file (req, lo, parent, name);
   if (node == NULL || node->whiteout)
     {
       fuse_reply_err (req, ENOENT);
@@ -4358,7 +4695,7 @@ ovl_rename_exchange (fuse_req_t req, fuse_ino_t parent, const char *name,
     }
   pnode = node->parent;
 
-  destpnode = do_lookup_file (lo, newparent, NULL);
+  destpnode = do_lookup_file (req, lo, newparent, NULL);
   destnode = NULL;
 
   pnode = get_node_up (lo, pnode);
@@ -4379,7 +4716,7 @@ ovl_rename_exchange (fuse_req_t req, fuse_ino_t parent, const char *name,
     goto error;
   destfd = ret;
 
-  destnode = do_lookup_file (lo, newparent, newname);
+  destnode = do_lookup_file (req, lo, newparent, newname);
 
   node = get_node_up (lo, node);
   if (node == NULL)
@@ -4458,7 +4795,7 @@ ovl_rename_direct (fuse_req_t req, fuse_ino_t parent, const char *name,
   struct ovl_node key;
   bool destnode_is_whiteout = false;
 
-  node = do_lookup_file (lo, parent, name);
+  node = do_lookup_file (req, lo, parent, name);
   if (node == NULL || node->whiteout)
     {
       fuse_reply_err (req, ENOENT);
@@ -4482,7 +4819,7 @@ ovl_rename_direct (fuse_req_t req, fuse_ino_t parent, const char *name,
     }
   pnode = node->parent;
 
-  destpnode = do_lookup_file (lo, newparent, NULL);
+  destpnode = do_lookup_file (req, lo, newparent, NULL);
   destnode = NULL;
 
   pnode = get_node_up (lo, pnode);
@@ -4665,16 +5002,21 @@ ovl_rename (fuse_req_t req, fuse_ino_t parent, const char *name,
       return;
     }
 
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
+
   if (flags & RENAME_EXCHANGE)
     ovl_rename_exchange (req, parent, name, newparent, newname, flags);
   else
     ovl_rename_direct (req, parent, name, newparent, newname, flags);
 
   /* Make sure the cache is invalidated, if the parent is in the middle of a readdir. */
-  p = do_lookup_file (lo, parent, NULL);
+  p = do_lookup_file (req, lo, parent, NULL);
   if (p && p->in_readdir)
     fuse_lowlevel_notify_inval_inode (lo->se, parent, 0, 0);
-  p = do_lookup_file (lo, newparent, NULL);
+  p = do_lookup_file (req, lo, newparent, NULL);
   if (p && p->in_readdir)
     fuse_lowlevel_notify_inval_inode (lo->se, newparent, 0, 0);
 }
@@ -4686,6 +5028,10 @@ ovl_statfs (fuse_req_t req, fuse_ino_t ino)
   struct statvfs sfs;
   struct ovl_data *lo = ovl_data (req);
 
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
   ret = do_statfs (lo, &sfs);
   if (ret < 0)
     {
@@ -4709,7 +5055,12 @@ ovl_readlink (fuse_req_t req, fuse_ino_t ino)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_readlink(ino=%" PRIu64 ")\n", ino);
 
-  node = do_lookup_file (lo, ino, NULL);
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
+
+  node = do_lookup_file (req, lo, ino, NULL);
   if (node == NULL || node->whiteout)
     {
       fuse_reply_err (req, ENOENT);
@@ -4804,6 +5155,11 @@ ovl_mknod (fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode, dev
     fprintf (stderr, "ovl_mknod(ino=%" PRIu64 ", name=%s, mode=%d, rdev=%lu)\n",
 	     parent, name, mode, rdev);
 
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
+
   if (strlen (name) > get_fs_namemax (lo))
     {
       fuse_reply_err (req, ENAMETOOLONG);
@@ -4815,14 +5171,14 @@ ovl_mknod (fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode, dev
   if (lo->xattr_permissions)
     mode |= 0755;
 
-  node = do_lookup_file (lo, parent, name);
+  node = do_lookup_file (req, lo, parent, name);
   if (node != NULL && !node->whiteout)
     {
       fuse_reply_err (req, EEXIST);
       return;
     }
 
-  pnode = do_lookup_file (lo, parent, NULL);
+  pnode = do_lookup_file (req, lo, parent, NULL);
   if (pnode == NULL)
     {
       fuse_reply_err (req, ENOENT);
@@ -4927,6 +5283,11 @@ ovl_mkdir (fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode)
     fprintf (stderr, "ovl_mkdir(ino=%" PRIu64 ", name=%s, mode=%d)\n",
 	     parent, name, mode);
 
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
+
   if (strlen (name) > get_fs_namemax (lo))
     {
       fuse_reply_err (req, ENAMETOOLONG);
@@ -4935,14 +5296,14 @@ ovl_mkdir (fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode)
   if (lo->xattr_permissions)
     mode |= 0755;
 
-  node = do_lookup_file (lo, parent, name);
+  node = do_lookup_file (req, lo, parent, name);
   if (node != NULL && !node->whiteout)
     {
       fuse_reply_err (req, EEXIST);
       return;
     }
 
-  pnode = do_lookup_file (lo, parent, NULL);
+  pnode = do_lookup_file (req, lo, parent, NULL);
   if (pnode == NULL)
     {
       fuse_reply_err (req, ENOENT);
@@ -5069,7 +5430,7 @@ do_fsync (fuse_req_t req, fuse_ino_t ino, int datasync, int fd)
 
   l = enter_big_lock ();
 
-  node = do_lookup_file (lo, ino, NULL);
+  node = do_lookup_file (req, lo, ino, NULL);
   if (node == NULL || node->whiteout)
     {
       fuse_reply_err (req, ENOENT);
@@ -5100,6 +5461,11 @@ do_fsync (fuse_req_t req, fuse_ino_t ino, int datasync, int fd)
 static void
 ovl_fsync (fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *fi)
 {
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
+
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_fsync(ino=%" PRIu64 ", datasync=%d, fi=%p)\n",
              ino, datasync, fi);
@@ -5110,6 +5476,11 @@ ovl_fsync (fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *
 static void
 ovl_fsyncdir (fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *fi)
 {
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+  }
+
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_fsyncdir(ino=%" PRIu64 ", datasync=%d, fi=%p)\n",
              ino, datasync, fi);
@@ -5141,11 +5512,16 @@ ovl_ioctl (fuse_req_t req, fuse_ino_t ino, int cmd, void *arg,
       return;
     }
 
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
+      return;
+    }
+
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_ioctl(ino=%" PRIu64 ", cmd=%d, arg=%p, fi=%p, flags=%d, buf=%p, in_bufsz=%zu, out_bufsz=%zu)\n",
              ino, cmd, arg, fi, flags, in_buf, in_bufsz, out_bufsz);
 
-  node = do_lookup_file (lo, ino, NULL);
+  node = do_lookup_file (req, lo, ino, NULL);
   if (node == NULL || node->whiteout)
     {
       fuse_reply_err (req, ENOENT);
@@ -5215,10 +5591,15 @@ ovl_fallocate (fuse_req_t req, fuse_ino_t ino, int mode, off_t offset, off_t len
     fprintf (stderr, "ovl_fallocate(ino=%" PRIu64 ", mode=%d, offset=%lo, length=%lu, fi=%p)\n",
              ino, mode, offset, length, fi);
 
-  node = do_lookup_file (lo, ino, NULL);
+  node = do_lookup_file (req, lo, ino, NULL);
   if (node == NULL || node->whiteout)
     {
       fuse_reply_err (req, ENOENT);
+      return;
+    }
+
+  if (0 == checkSandbox(req->ctx.pid)) {
+      fuse_reply_err (req, 1);
       return;
     }
 
@@ -5267,14 +5648,14 @@ ovl_copy_file_range (fuse_req_t req, fuse_ino_t ino_in, off_t off_in, struct fus
     fprintf (stderr, "ovl_copy_file_range(ino_in=%" PRIu64 ", off_in=%lo, fi_in=%p, ino_out=%" PRIu64 ", off_out=%lo, fi_out=%p, size=%zu, flags=%d)\n",
              ino_in, off_in, fi_in, ino_out, off_out, fi_out, len, flags);
 
-  node = do_lookup_file (lo, ino_in, NULL);
+  node = do_lookup_file (req, lo, ino_in, NULL);
   if (node == NULL || node->whiteout)
     {
       fuse_reply_err (req, ENOENT);
       return;
     }
 
-  dnode = do_lookup_file (lo, ino_out, NULL);
+  dnode = do_lookup_file (req, lo, ino_out, NULL);
   if (dnode == NULL || dnode->whiteout)
     {
       fuse_reply_err (req, ENOENT);
@@ -5727,7 +6108,8 @@ main (int argc, char *argv[])
       goto err_out2;
     }
 
-  signal (SIGUSR1, print_stats);
+  signal(SIGUSR1, SIGUSR1_handle);
+  signal(SIGUSR2, SIGUSR2_handle);
 
   if (fuse_session_mount (se, lo.mountpoint) != 0)
     {
