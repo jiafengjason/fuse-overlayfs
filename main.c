@@ -995,10 +995,12 @@ static int checkAccess(fuse_req_t req, struct ovl_data *lo, char *nodePath) {
     //char command[150];
     //int count;
 
+    /*
     if (UNLIKELY (ovl_debug (req)))
     {
         fprintf(stderr, "checkAccess path=%s\n", nodePath);
     }
+    */
 
     if (hostpid[0] == 0)
     {
