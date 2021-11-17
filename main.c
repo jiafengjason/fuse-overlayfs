@@ -962,12 +962,12 @@ static int checkSandbox(int pid_guest) {
 }
 */
 
-static int checkSandbox(int pid_guest) 
+int checkSandbox(int pid_guest) 
 {
     return 1;
 }
 
-static int checkPath(struct ovl_data *lo, char *path) 
+int checkPath(struct ovl_data *lo, char *path) 
 {
     char *dirc;
     char *dname;
@@ -982,7 +982,7 @@ static int checkPath(struct ovl_data *lo, char *path)
     else
     {
         return 1;
-    }  
+    }
 }
 
 static int checkAccess(fuse_req_t req, struct ovl_data *lo, char *nodePath) {
