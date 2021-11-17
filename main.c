@@ -985,7 +985,7 @@ int checkPath(struct ovl_data *lo, char *path)
     }
 }
 
-static int checkAccess(fuse_req_t req, struct ovl_data *lo, char *nodePath) {
+int checkAccess(fuse_req_t req, struct ovl_data *lo, char *nodePath) {
     char guestpid[64];
     char path[64];
     int pid;
