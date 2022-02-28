@@ -4113,7 +4113,7 @@ static void unshuffleBytes(unsigned char *buf, int size)
 /** Partial blocks are encoded with a stream cipher.  We make multiple passes on
  the data to ensure that the ends of the data depend on each other.
 */
-bool streamEncode(unsigned char *buf, int size, uint64_t iv64)
+bool streamEncode(fuse_req_t req, unsigned char *buf, int size, uint64_t iv64)
 {
   unsigned char ivec[MAX_IVLENGTH];
   int dstLen = 0, tmpLen = 0;
@@ -4140,14 +4140,17 @@ bool streamEncode(unsigned char *buf, int size, uint64_t iv64)
   pthread_mutex_unlock(&gSSLKey.mutex);
   if (dstLen != size)
   {
-    fprintf (stderr,  "encoding %d bytes, got back %d (%d in final_ex)\n", size, dstLen, tmpLen);
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf (stderr,  "encoding %d bytes, got back %d (%d in final_ex)\n", size, dstLen, tmpLen);
+    }
     return false;
   }
 
   return true;
 }
 
-bool streamDecode(unsigned char *buf, int size, uint64_t iv64)
+bool streamDecode(fuse_req_t req, unsigned char *buf, int size, uint64_t iv64)
 {
   unsigned char ivec[MAX_IVLENGTH];
   int dstLen = 0, tmpLen = 0;
@@ -4174,14 +4177,17 @@ bool streamDecode(unsigned char *buf, int size, uint64_t iv64)
   
   if (dstLen != size)
   {
-    fprintf (stderr,  "decoding %d bytes, got back %d (%d in final_ex)\n", size, dstLen, tmpLen);
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf (stderr,  "decoding %d bytes, got back %d (%d in final_ex)\n", size, dstLen, tmpLen);
+    }
     return false;
   }
 
   return true;
 }
 
-bool blockEncode(unsigned char *buf, int size, uint64_t iv64)
+bool blockEncode(fuse_req_t req, unsigned char *buf, int size, uint64_t iv64)
 {
   unsigned char ivec[MAX_IVLENGTH];
   int dstLen = 0, tmpLen = 0;
@@ -4189,7 +4195,10 @@ bool blockEncode(unsigned char *buf, int size, uint64_t iv64)
   // data must be integer number of blocks
   const int blockMod = size % EVP_CIPHER_CTX_block_size(gSSLKey.block_enc);
   if (blockMod != 0) {
-    fprintf (stderr, "Invalid data size, not multiple of block size\n");
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf (stderr, "Invalid data size, not multiple of block size\n");
+    }
     return false;
   }
 
@@ -4205,14 +4214,17 @@ bool blockEncode(unsigned char *buf, int size, uint64_t iv64)
 
   if (dstLen != size)
   {
-    fprintf (stderr,  "encoding %d bytes, got back %d (%d in final_ex)\n", size, dstLen, tmpLen);
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf (stderr,  "encoding %d bytes, got back %d (%d in final_ex)\n", size, dstLen, tmpLen);
+    }
     return false;
   }
 
   return true;
 }
 
-bool blockDecode(unsigned char *buf, int size, uint64_t iv64)
+bool blockDecode(fuse_req_t req, unsigned char *buf, int size, uint64_t iv64)
 {
   unsigned char ivec[MAX_IVLENGTH];
   int dstLen = 0, tmpLen = 0;
@@ -4220,7 +4232,10 @@ bool blockDecode(unsigned char *buf, int size, uint64_t iv64)
   // data must be integer number of blocks
   const int blockMod = size % EVP_CIPHER_CTX_block_size(gSSLKey.block_dec);
   if (blockMod != 0) {
-    fprintf (stderr, "Invalid data size, not multiple of block size\n");
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf (stderr, "Invalid data size, not multiple of block size\n");
+    }
     return false;
   }
 
@@ -4236,7 +4251,10 @@ bool blockDecode(unsigned char *buf, int size, uint64_t iv64)
 
   if (dstLen != size)
   {
-    fprintf (stderr,  "decoding %d bytes, got back %d (%d in final_ex)\n", size, dstLen, tmpLen);
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf (stderr,  "decoding %d bytes, got back %d (%d in final_ex)\n", size, dstLen, tmpLen);
+    }
     return false;
   }
 
@@ -4281,28 +4299,34 @@ void printhex(unsigned char *src,int len)
  * or
  * Read block from backing plaintext file, then encrypt it (reverse mode)
  */
-ssize_t readOneBlock(const struct IORequest *req)
+ssize_t readOneBlock(fuse_req_t req, const struct IORequest *blockReq)
 {
   bool ok;
   int i = 0;
-  off_t blockNum = req->offset / gBlockSize;
+  off_t blockNum = blockReq->offset / gBlockSize;
 
-  ssize_t readSize = pread(req->fd, req->data, req->dataLen, req->offset);
+  ssize_t readSize = pread(blockReq->fd, blockReq->data, blockReq->dataLen, blockReq->offset);
   if (readSize < 0) {
     int eno = errno;
-    fprintf (stderr, "read failed at fd %d offset %d for %d bytes: %s\n", req->fd, req->offset, req->dataLen, strerror(eno));
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf (stderr, "read failed at fd %d offset %d for %d bytes: %s\n", blockReq->fd, blockReq->offset, blockReq->dataLen, strerror(eno));
+    }
     readSize = -eno;
   }
 
-  fprintf (stderr, "readOneBlock raw(%d)", readSize, req->data);
-  printhex((unsigned char*)req->data, readSize);
-  fprintf (stderr, "\n");
+  if (UNLIKELY (ovl_debug (req)))
+  {
+    fprintf (stderr, "readOneBlock raw(%d)", readSize, blockReq->data);
+    printhex((unsigned char*)blockReq->data, readSize);
+    fprintf (stderr, "\n");
+  }
 
   if (readSize > 0)
   {
     if (readSize != gBlockSize)
     {
-      ok = streamDecode(req->data, (int)readSize, blockNum ^ 0);
+      ok = streamDecode(req, blockReq->data, (int)readSize, blockNum ^ 0);
       // cast works because we work on a block and blocksize fit an int
     }
     else
@@ -4310,65 +4334,83 @@ ssize_t readOneBlock(const struct IORequest *req)
       if (gAllowHoles) {
         // special case - leave all 0's alone
         for (i = 0; i < readSize; ++i) {
-          if (req->data[i] != 0) {
-            ok = blockDecode(req->data, (int)readSize, blockNum ^ 0);
+          if (blockReq->data[i] != 0) {
+            ok = blockDecode(req, blockReq->data, (int)readSize, blockNum ^ 0);
             break;
           }
         }
       }
       else
       {
-        ok = blockDecode(req->data, (int)readSize, blockNum ^ 0);
+        ok = blockDecode(req, blockReq->data, (int)readSize, blockNum ^ 0);
       }
     }
 
     if (!ok) {
-      fprintf (stderr, "decodeBlock failed for block %d, size %d\n", blockNum, readSize);
+      if (UNLIKELY (ovl_debug (req)))
+      {
+        fprintf (stderr, "decodeBlock failed for block %d, size %d\n", blockNum, readSize);
+      }
       readSize = -EBADMSG;
     }
   }
   else if (readSize == 0)
   {
-    fprintf (stderr, "readSize zero for offset %d\n", req->offset);
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf (stderr, "readSize zero for offset %d\n", blockReq->offset);
+    }
   }
 
-  fprintf (stderr, "readOneBlock decode ok=%d(%d)", ok, readSize, req->data);
-  printhex((unsigned char*)req->data, readSize);
-  fprintf (stderr, "\n");
+  if (UNLIKELY (ovl_debug (req)))
+  {
+    fprintf (stderr, "readOneBlock decode ok=%d(%d)", ok, readSize, blockReq->data);
+    printhex((unsigned char*)blockReq->data, readSize);
+    fprintf (stderr, "\n");
+  }
 
   return readSize;
 }
 
-ssize_t writeOneBlock(const struct IORequest *req)
+ssize_t writeOneBlock(fuse_req_t req, const struct IORequest *blockReq)
 {
     bool ok;
     ssize_t res = 0;
-    void *buf = req->data;
-    ssize_t bytes = req->dataLen;
-    off_t offset = req->offset;
-    off_t blockNum = req->offset / gBlockSize;
+    void *buf = blockReq->data;
+    ssize_t bytes = blockReq->dataLen;
+    off_t offset = blockReq->offset;
+    off_t blockNum = blockReq->offset / gBlockSize;
 
-    if (req->dataLen != gBlockSize) {
-        ok = streamEncode(req->data, (int)req->dataLen, blockNum ^ 0);
+    if (blockReq->dataLen != gBlockSize) {
+        ok = streamEncode(req, blockReq->data, (int)blockReq->dataLen, blockNum ^ 0);
         // cast works because we work on a block and blocksize fit an int
     } else {
-        ok = blockEncode(req->data, (int)req->dataLen, blockNum ^ 0);
+        ok = blockEncode(req, blockReq->data, (int)blockReq->dataLen, blockNum ^ 0);
         // cast works because we work on a block and blocksize fit an int
     }
-
-    fprintf (stderr, "writeOneBlock ok=%d(%d):", ok, req->dataLen);
-    printhex((unsigned char*)req->data, req->dataLen);
-    fprintf (stderr, "\n");
+    
+    if (UNLIKELY (ovl_debug (req)))
+    {
+        fprintf (stderr, "writeOneBlock ok=%d(%d):", ok, blockReq->dataLen);
+        printhex((unsigned char*)blockReq->data, blockReq->dataLen);
+        fprintf (stderr, "\n");
+    }
 
     if (ok)
     {
         while (bytes != 0) {
-            fprintf (stderr, "pwrite at offset %d for %d bytes:%X\n", offset, bytes, *req->data);
-            ssize_t writeSize = pwrite(req->fd, buf, bytes, offset);
+            if (UNLIKELY (ovl_debug (req)))
+            {
+                fprintf (stderr, "pwrite at offset %d for %d bytes:%X\n", offset, bytes, *blockReq->data);
+            }
+            ssize_t writeSize = pwrite(blockReq->fd, buf, bytes, offset);
 
             if (writeSize < 0) {
                 int eno = errno;
-                fprintf (stderr, "pwrite failed at offset %d for %d bytes: %s\n", offset, bytes, strerror(eno));
+                if (UNLIKELY (ovl_debug (req)))
+                {
+                    fprintf (stderr, "pwrite failed at offset %d for %d bytes: %s\n", offset, bytes, strerror(eno));
+                }
                 // pwrite is not expected to return 0, so eno should always be set, but we never know...
                 return -eno;
             }
@@ -4380,9 +4422,12 @@ ssize_t writeOneBlock(const struct IORequest *req)
             offset += writeSize;
             buf = (void *)((char *)buf + writeSize);
         }
-        return req->dataLen;
+        return blockReq->dataLen;
     } else {
-        fprintf (stderr, "encodeBlock failed for block %d, size %d\n", blockNum, req->dataLen);
+        if (UNLIKELY (ovl_debug (req)))
+        {
+            fprintf (stderr, "encodeBlock failed for block %d, size %d\n", blockNum, blockReq->dataLen);
+        }
         res = -EBADMSG;
     }
 
@@ -4401,21 +4446,24 @@ static void clearCache(struct IORequest *req, unsigned int blockSize)
  * Always requests full blocks form the lower layer, truncates the
  * returned data as neccessary.
  */
-ssize_t cacheReadOneBlock(const struct IORequest *req)
+ssize_t cacheReadOneBlock(fuse_req_t req, const struct IORequest *blockReq)
 {
   /* we can satisfy the request even if _cache.dataLen is too short, because
    * we always request a full block during reads. This just means we are
    * in the last block of a file, which may be smaller than the blocksize.
    * For reverse encryption, the cache must not be used at all, because
    * the lower file may have changed behind our back. */
-  if ((req->offset == gCache.offset) && (gCache.dataLen != 0)) {
+  if ((blockReq->offset == gCache.offset) && (gCache.dataLen != 0)) {
     // satisfy request from cache
-    fprintf(stderr, "Read from cache offset=%d, dataLen=%d\n", gCache.offset, gCache.dataLen);
-    size_t len = req->dataLen;
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf(stderr, "Read from cache offset=%d, dataLen=%d\n", gCache.offset, gCache.dataLen);
+    }
+    size_t len = blockReq->dataLen;
     if (gCache.dataLen < len) {
       len = gCache.dataLen;  // Don't read past EOF
     }
-    memcpy(req->data, gCache.data, len);
+    memcpy(blockReq->data, gCache.data, len);
     return len;
   }
   
@@ -4426,78 +4474,87 @@ ssize_t cacheReadOneBlock(const struct IORequest *req)
 
   // cache results of read -- issue reads for full blocks
   struct IORequest tmp;
-  tmp.fd = req->fd;
-  tmp.offset = req->offset;
+  tmp.fd = blockReq->fd;
+  tmp.offset = blockReq->offset;
   tmp.data = gCache.data;
   tmp.dataLen = gBlockSize;
-  ssize_t result = readOneBlock(&tmp);
+  ssize_t result = readOneBlock(req, &tmp);
   if (result > 0) {
-    gCache.offset = req->offset;
+    gCache.offset = blockReq->offset;
     gCache.dataLen = result;  // the amount we really have
-    if ((size_t)result > req->dataLen) {
-      result = req->dataLen;  // only as much as requested
+    if ((size_t)result > blockReq->dataLen) {
+      result = blockReq->dataLen;  // only as much as requested
     }
-    memcpy(req->data, gCache.data, result);
-    fprintf(stderr, "cacheReadOneBlock save cache: offset=%d, dataLen=%d\n", req->offset, req->dataLen);
+    memcpy(blockReq->data, gCache.data, result);
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf(stderr, "cacheReadOneBlock save cache: offset=%d, dataLen=%d\n", blockReq->offset, blockReq->dataLen);
+    }
   }
   return result;
 }
 
-ssize_t cacheWriteOneBlock(const struct IORequest *req)
+ssize_t cacheWriteOneBlock(fuse_req_t req, const struct IORequest *blockReq)
 {
   // Let's point request buffer to our own buffer, as it may be modified by
   // encryption : originating process may not like to have its buffer modified
-  memcpy(gCache.data, req->data, req->dataLen);
+  memcpy(gCache.data, blockReq->data, blockReq->dataLen);
   struct IORequest tmp;
-  tmp.fd = req->fd;
-  tmp.offset = req->offset;
+  tmp.fd = blockReq->fd;
+  tmp.offset = blockReq->offset;
   tmp.data = gCache.data;
-  tmp.dataLen = req->dataLen;
-  ssize_t res = writeOneBlock(&tmp);
+  tmp.dataLen = blockReq->dataLen;
+  ssize_t res = writeOneBlock(req, &tmp);
   if (res < 0) {
     clearCache(&gCache, gBlockSize);
   }
   else {
     // And now we can cache the write buffer from the request
-    memcpy(gCache.data, req->data, req->dataLen);
-    gCache.offset = req->offset;
-    gCache.dataLen = req->dataLen;
-    fprintf(stderr, "cacheWriteOneBlock save cache: offset=%d, dataLen=%d\n", req->offset, req->dataLen);
+    memcpy(gCache.data, blockReq->data, blockReq->dataLen);
+    gCache.offset = blockReq->offset;
+    gCache.dataLen = blockReq->dataLen;
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf(stderr, "cacheWriteOneBlock save cache: offset=%d, dataLen=%d\n", blockReq->offset, blockReq->dataLen);
+    }
   }
   return res;
 }
 
-ssize_t readBlocks(const struct IORequest *req)
+ssize_t readBlocks(fuse_req_t req, const struct IORequest *blockReq)
 {
-    int partialOffset = req->offset % gBlockSize;  // can be int as _blockSize is int
-    off_t blockNum = req->offset / gBlockSize;
+    int partialOffset = blockReq->offset % gBlockSize;  // can be int as _blockSize is int
+    off_t blockNum = blockReq->offset / gBlockSize;
     ssize_t result = 0;
     BUF_MEM *data = NULL;
 
-    if (partialOffset == 0 && req->dataLen <= gBlockSize)
+    if (partialOffset == 0 && blockReq->dataLen <= gBlockSize)
     {
         // read completely within a single block -- can be handled as-is by readOneBlock().
-        return cacheReadOneBlock(req);
+        return cacheReadOneBlock(req, blockReq);
     }
-    size_t size = req->dataLen;
+    size_t size = blockReq->dataLen;
 
     // if the request is larger than a block, then request each block individually
-    struct IORequest blockReq;  // for requests we may need to make
-    blockReq.fd = req->fd;
-    blockReq.dataLen = gBlockSize;
-    blockReq.data = NULL;
+    struct IORequest tmp;  // for requests we may need to make
+    tmp.fd = blockReq->fd;
+    tmp.dataLen = gBlockSize;
+    tmp.data = NULL;
 
-    unsigned char *out = req->data;
+    unsigned char *out = blockReq->data;
     while (size != 0u)
     {
-        blockReq.offset = blockNum * gBlockSize;
-        fprintf(stderr, "readBlocks: offset=%d, dataLen=%d\n", blockReq.offset, blockReq.dataLen);
-
+        tmp.offset = blockNum * gBlockSize;
+        if (UNLIKELY (ovl_debug (req)))
+        {
+            fprintf(stderr, "readBlocks: offset=%d, dataLen=%d\n", tmp.offset, tmp.dataLen);
+        }
+        
         // if we're reading a full block, then read directly into the
         // result buffer instead of using a temporary
         if (partialOffset == 0 && size >= gBlockSize)
         {
-            blockReq.data = out;
+            tmp.data = out;
         }
         else
         {
@@ -4506,10 +4563,10 @@ ssize_t readBlocks(const struct IORequest *req)
                 data = BUF_MEM_new();
                 BUF_MEM_grow(data, gBlockSize);
             }
-            blockReq.data = (unsigned char *)(data->data);
+            tmp.data = (unsigned char *)(data->data);
         }
 
-        ssize_t readSize = cacheReadOneBlock(&blockReq);
+        ssize_t readSize = cacheReadOneBlock(req, &tmp);
         if (readSize < 0) {
             result = readSize;
             break;
@@ -4522,8 +4579,8 @@ ssize_t readBlocks(const struct IORequest *req)
         CHECK(cpySize <= (size_t)readSize);
 
         // if we read to a temporary buffer, then move the data
-        if (blockReq.data != out) {
-            memcpy(out, blockReq.data + partialOffset, cpySize);
+        if (tmp.data != out) {
+            memcpy(out, tmp.data + partialOffset, cpySize);
         }
 
         result += cpySize;
@@ -4544,9 +4601,9 @@ ssize_t readBlocks(const struct IORequest *req)
     return result;
 }
 
-int padFile(int fd, off_t oldSize, off_t newSize, bool forceWrite)
+int padFile(fuse_req_t req, int fd, off_t oldSize, off_t newSize, bool forceWrite)
 {
-  struct IORequest req;
+  struct IORequest blockReq;
   ssize_t res = 0;
   BUF_MEM *data = NULL;
 
@@ -4558,27 +4615,33 @@ int padFile(int fd, off_t oldSize, off_t newSize, bool forceWrite)
     // when the real write occurs, it will have to read in the existing
     // data and pad it anyway, so we won't do it here (unless we're
     // forced).
-    fprintf(stderr, "optimization: not padding last block\n");
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf(stderr, "optimization: not padding last block\n");
+    }
   } else {
     data = BUF_MEM_new();
     BUF_MEM_grow(data, gBlockSize);
-    req.data = (unsigned char *)(data->data);
+    blockReq.data = (unsigned char *)(data->data);
 
     // 1. extend the first block to full length
     // 2. write the middle empty blocks
     // 3. write the last block
 
-    req.fd = fd;
-    req.offset = oldLastBlock * gBlockSize;
-    req.dataLen = oldSize % gBlockSize;
+    blockReq.fd = fd;
+    blockReq.offset = oldLastBlock * gBlockSize;
+    blockReq.dataLen = oldSize % gBlockSize;
 
     // 1. req.dataLen == 0, iff oldSize was already a multiple of blocksize
-    if (req.dataLen != 0) {
-      fprintf (stderr, "padding block %d\n", oldLastBlock);
+    if (blockReq.dataLen != 0) {
+      if (UNLIKELY (ovl_debug (req)))
+      {
+        fprintf (stderr, "padding block %d\n", oldLastBlock);
+      }
       memset(data, 0, gBlockSize);
-      if ((res = cacheReadOneBlock(&req)) >= 0) {
-        req.dataLen = gBlockSize;  // expand to full block size
-        res = cacheWriteOneBlock(&req);
+      if ((res = cacheReadOneBlock(req, &blockReq)) >= 0) {
+        blockReq.dataLen = gBlockSize;  // expand to full block size
+        res = cacheWriteOneBlock(req, &blockReq);
       }
       ++oldLastBlock;
     }
@@ -4586,20 +4649,23 @@ int padFile(int fd, off_t oldSize, off_t newSize, bool forceWrite)
     // 2, pad zero blocks unless holes are allowed
     if (!gAllowHoles) {
       for (; (res >= 0) && (oldLastBlock != newLastBlock); ++oldLastBlock) {
-        fprintf (stderr, "padding block %d\n", oldLastBlock);
-        req.offset = oldLastBlock * gBlockSize;
-        req.dataLen = gBlockSize;
-        memset(data, 0, req.dataLen);
-        res = cacheWriteOneBlock(&req);
+        if (UNLIKELY (ovl_debug (req)))
+        {
+          fprintf (stderr, "padding block %d\n", oldLastBlock);
+        }
+        blockReq.offset = oldLastBlock * gBlockSize;
+        blockReq.dataLen = gBlockSize;
+        memset(data, 0, blockReq.dataLen);
+        res = cacheWriteOneBlock(req, &blockReq);
       }
     }
 
     // 3. only necessary if write is forced and block is non 0 length
     if ((res >= 0) && forceWrite && (newBlockSize != 0)) {
-      req.offset = newLastBlock * gBlockSize;
-      req.dataLen = newBlockSize;
-      memset(data, 0, req.dataLen);
-      res = cacheWriteOneBlock(&req);
+      blockReq.offset = newLastBlock * gBlockSize;
+      blockReq.dataLen = newBlockSize;
+      memset(data, 0, blockReq.dataLen);
+      res = cacheWriteOneBlock(req, &blockReq);
     }
   }
 
@@ -4616,65 +4682,68 @@ int padFile(int fd, off_t oldSize, off_t newSize, bool forceWrite)
 /**
  * Returns the number of bytes written, or -errno in case of failure.
  */
-ssize_t writeBlocks(off_t fileSize, const struct IORequest *req)
+ssize_t writeBlocks(fuse_req_t req, off_t fileSize, const struct IORequest *blockReq)
 {
   BUF_MEM *data = NULL;
   
   // where write request begins
-  off_t blockNum = req->offset / gBlockSize;
-  int partialOffset = req->offset % gBlockSize;  // can be int as _blockSize is int
+  off_t blockNum = blockReq->offset / gBlockSize;
+  int partialOffset = blockReq->offset % gBlockSize;  // can be int as _blockSize is int
 
   // last block of file (for testing write overlaps with file boundary)
   off_t lastFileBlock = fileSize / gBlockSize;
   size_t lastBlockSize = fileSize % gBlockSize;
 
-  fprintf(stderr, "writeBlocks:fd=%d fileSize=%d lastBlockSize=%d\n", req->fd, fileSize, lastBlockSize);
+  if (UNLIKELY (ovl_debug (req)))
+  {
+    fprintf(stderr, "writeBlocks:fd=%d fileSize=%d lastBlockSize=%d\n", blockReq->fd, fileSize, lastBlockSize);
+  }
 
   off_t lastNonEmptyBlock = lastFileBlock;
   if (lastBlockSize == 0) {
     --lastNonEmptyBlock;
   }
 
-  if (req->offset > fileSize) {
+  if (blockReq->offset > fileSize) {
     // extend file first to fill hole with 0's..
-    int res = padFile(req->fd, fileSize, req->offset, false);
+    int res = padFile(req, blockReq->fd, fileSize, blockReq->offset, false);
     if (res < 0) {
       return res;
     }
   }
 
   // check against edge cases where we can just let the base class handle the request as-is..
-  if (partialOffset == 0 && req->dataLen <= gBlockSize) {
+  if (partialOffset == 0 && blockReq->dataLen <= gBlockSize) {
     // if writing a full block.. pretty safe..
-    if (req->dataLen == gBlockSize) {
-      return cacheWriteOneBlock(req);
+    if (blockReq->dataLen == gBlockSize) {
+      return cacheWriteOneBlock(req, blockReq);
     }
 
     // if writing a partial block, but at least as much as what is already there..
-    if (blockNum == lastFileBlock && req->dataLen >= lastBlockSize) {
-      return cacheWriteOneBlock(req);
+    if (blockNum == lastFileBlock && blockReq->dataLen >= lastBlockSize) {
+      return cacheWriteOneBlock(req, blockReq);
     }
   }
 
   // have to merge data with existing block(s)..
-  struct IORequest blockReq;
-  blockReq.fd = req->fd;
-  blockReq.data = NULL;
-  blockReq.dataLen = gBlockSize;
+  struct IORequest tmp;
+  tmp.fd = blockReq->fd;
+  tmp.data = NULL;
+  tmp.dataLen = gBlockSize;
 
   ssize_t res = 0;
-  size_t size = req->dataLen;
-  unsigned char *inPtr = req->data;
+  size_t size = blockReq->dataLen;
+  unsigned char *inPtr = blockReq->data;
   while (size != 0u) {
-    blockReq.offset = blockNum * gBlockSize;
+    tmp.offset = blockNum * gBlockSize;
     size_t toCopy = min((size_t)gBlockSize - (size_t)partialOffset, size);
 
     // if writing an entire block, or writing a partial block that requires no merging with existing data..
-    if ((toCopy == gBlockSize) || (partialOffset == 0 && blockReq.offset + (off_t)toCopy >= fileSize))
+    if ((toCopy == gBlockSize) || (partialOffset == 0 && tmp.offset + (off_t)toCopy >= fileSize))
     {
       // write directly from buffer
-      blockReq.data = inPtr;
-      blockReq.dataLen = toCopy;
+      tmp.data = inPtr;
+      tmp.dataLen = toCopy;
     } else {
       // need a temporary buffer, since we have to either merge or pad the data.
       if (data == NULL)
@@ -4683,32 +4752,32 @@ ssize_t writeBlocks(off_t fileSize, const struct IORequest *req)
           BUF_MEM_grow(data, gBlockSize);
       }
       memset(data->data, 0, gBlockSize);
-      blockReq.data = (unsigned char *)(data->data);
+      tmp.data = (unsigned char *)(data->data);
 
       if (blockNum > lastNonEmptyBlock) {
         // just pad..
-        blockReq.dataLen = partialOffset + toCopy;
+        tmp.dataLen = partialOffset + toCopy;
       } else {
         // have to merge with existing block data..
-        blockReq.dataLen = gBlockSize;
-        ssize_t readSize = cacheReadOneBlock(&blockReq);
+        tmp.dataLen = gBlockSize;
+        ssize_t readSize = cacheReadOneBlock(req, &tmp);
         if (readSize < 0) {
           res = readSize;
           break;
         }
-        blockReq.dataLen = readSize;
+        tmp.dataLen = readSize;
 
         // extend data if necessary..
-        if (partialOffset + toCopy > blockReq.dataLen) {
-          blockReq.dataLen = partialOffset + toCopy;
+        if (partialOffset + toCopy > tmp.dataLen) {
+          tmp.dataLen = partialOffset + toCopy;
         }
       }
       // merge in the data to be written..
-      memcpy(blockReq.data + partialOffset, inPtr, toCopy);
+      memcpy(tmp.data + partialOffset, inPtr, toCopy);
     }
 
     // Finally, write the damn thing!
-    res = cacheWriteOneBlock(&blockReq);
+    res = cacheWriteOneBlock(req, &tmp);
     if (res < 0) {
       break;
     }
@@ -4727,47 +4796,57 @@ ssize_t writeBlocks(off_t fileSize, const struct IORequest *req)
   if (res < 0) {
     return res;
   }
-  return req->dataLen;
+  return blockReq->dataLen;
 }
 
 static void ovl_read (fuse_req_t req, fuse_ino_t ino, size_t size,
 	 off_t offset, struct fuse_file_info *fi)
 {
-    /*
-    struct fuse_bufvec buf = FUSE_BUFVEC_INIT (size);
-
-    buf.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK | FUSE_BUF_FD_RETRY;
-    buf.buf[0].fd = fi->fh;
-    buf.buf[0].pos = offset;
-
-    fuse_reply_data (req, &buf, 0);
-    */
     ssize_t res = 0;
     uint64_t fh;
     char* buffer = NULL;
-    struct IORequest tmpReq;
+    struct IORequest blockReq;
+    struct ovl_node *node;
+    struct ovl_data *lo = ovl_data (req);
     
     if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_read(ino=%" PRIu64 ", size=%zd, off=%lu)\n", ino, size, (unsigned long) offset);
 
-    buffer = (char *)malloc(size);
-    memset(buffer, 0 , size);
-    
-    tmpReq.fd = fi->fh;
-    tmpReq.offset = offset;
-    tmpReq.dataLen = size;
-    tmpReq.data = buffer;
-    pthread_mutex_lock (&lock);
-    readBlocks(&tmpReq);
-    pthread_mutex_unlock (&lock);
+    node = inode_to_node (lo, ino);
 
-    if (UNLIKELY (ovl_debug (req)))
+    fprintf (stderr, "path=%s name=%s layer=%p last_layer=%p lower=%p upper=%p\n", node->path, node->name, node->layer, node->last_layer, get_lower_layers (lo), get_upper_layer (lo));
+
+    if (node->last_layer == get_upper_layer (lo))
     {
-        fprintf (stderr, "ovl_read decode(%d):%s\n", size, buffer);
+        buffer = (char *)malloc(size);
+        memset(buffer, 0 , size);
+        
+        blockReq.fd = fi->fh;
+        blockReq.offset = offset;
+        blockReq.dataLen = size;
+        blockReq.data = buffer;
+        pthread_mutex_lock (&lock);
+        readBlocks(req, &blockReq);
+        pthread_mutex_unlock (&lock);
+
+        if (UNLIKELY (ovl_debug (req)))
+        {
+            fprintf (stderr, "ovl_read decode(%d):%s\n", size, buffer);
+        }
+        
+        //reply_buf_limited(req, buffer, size, offset, size);
+        fuse_reply_buf(req, buffer, size);
     }
-    
-    //reply_buf_limited(req, buffer, size, offset, size);
-    fuse_reply_buf(req, buffer, size);
+    else
+    {
+        struct fuse_bufvec buf = FUSE_BUFVEC_INIT (size);
+
+        buf.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK | FUSE_BUF_FD_RETRY;
+        buf.buf[0].fd = fi->fh;
+        buf.buf[0].pos = offset;
+
+        fuse_reply_data (req, &buf, 0);
+    }
 
     free(buffer);
 }
@@ -4785,7 +4864,7 @@ static void ovl_write_buf (fuse_req_t req, fuse_ino_t ino,
     struct ovl_ino *inode;
     int saved_errno;
     struct fuse_buf *buf = NULL;
-    struct IORequest tmpReq;
+    struct IORequest blockReq;
     struct stat s;
     int ret = 0;
 
@@ -4801,56 +4880,62 @@ static void ovl_write_buf (fuse_req_t req, fuse_ino_t ino,
             ino, out_buf.buf[0].size, (unsigned long) off, (int) fi->fh);
     }
 
-    buf = &in_buf->buf[0];
-    if (UNLIKELY (ovl_debug (req)))
+    if (node->last_layer == get_upper_layer (lo))
     {
-        fprintf (stderr, "ovl_write_buf(%d, %d, %d):", buf->size, in_buf->off, buf->pos);
-        printhex((unsigned char*)buf->mem, buf->size);
-        fprintf (stderr, "\n");
-    }
 
-    tmpReq.fd = fi->fh;
-    tmpReq.offset = off;
-    tmpReq.dataLen = buf->size;
-    tmpReq.data = (unsigned char *)buf->mem;
-    pthread_mutex_lock (&lock);
-    node = do_lookup_file (req, lo, ino, NULL);
-    if (node == NULL || node->whiteout)
-    {
-        fuse_reply_err (req, ENOENT);
-        return;
-    }
+        buf = &in_buf->buf[0];
+        if (UNLIKELY (ovl_debug (req)))
+        {
+            fprintf (stderr, "ovl_write_buf(%d, %d, %d):", buf->size, in_buf->off, buf->pos);
+            printhex((unsigned char*)buf->mem, buf->size);
+            fprintf (stderr, "\n");
+        }
 
-    ret = rpl_stat (req, node, -1, NULL, NULL, &s);
-    if (ret)
-    {
-      fuse_reply_err (req, errno);
-      return;
-    }
+        blockReq.fd = fi->fh;
+        blockReq.offset = off;
+        blockReq.dataLen = buf->size;
+        blockReq.data = (unsigned char *)buf->mem;
+        pthread_mutex_lock (&lock);
+        node = inode_to_node (lo, ino);
+        if (node == NULL || node->whiteout)
+        {
+            fuse_reply_err (req, ENOENT);
+            return;
+        }
 
-    res = writeBlocks(s.st_size, &tmpReq);
-    saved_errno = errno;
-    pthread_mutex_unlock (&lock);
-
-  //errno = 0;
-  //res = fuse_buf_copy (&out_buf, in_buf, 0);
-  //saved_errno = errno;
-  
-  inode = lookup_inode (lo, ino);
-  /* if it is a writepage request, make sure to restore the setuid bit.  */
-  if (fi->writepage && (inode->mode & (S_ISUID|S_ISGID)))
-    {
-      if (do_fchmod (lo, fi->fh, inode->mode) < 0)
+        ret = rpl_stat (req, node, -1, NULL, NULL, &s);
+        if (ret)
         {
           fuse_reply_err (req, errno);
           return;
         }
+
+        res = writeBlocks(req, s.st_size, &blockReq);
+        saved_errno = errno;
+        pthread_mutex_unlock (&lock);
+    }
+    else
+    {
+        errno = 0;
+        res = fuse_buf_copy (&out_buf, in_buf, 0);
+        saved_errno = errno;
     }
 
-  if (res < 0)
-    fuse_reply_err (req, saved_errno);
-  else
-    fuse_reply_write (req, (size_t) res);
+    inode = lookup_inode (lo, ino);
+    /* if it is a writepage request, make sure to restore the setuid bit.  */
+    if (fi->writepage && (inode->mode & (S_ISUID|S_ISGID)))
+    {
+        if (do_fchmod (lo, fi->fh, inode->mode) < 0)
+        {
+            fuse_reply_err (req, errno);
+            return;
+        }
+    }
+
+    if (res < 0)
+        fuse_reply_err (req, saved_errno);
+    else
+        fuse_reply_write (req, (size_t) res);
 }
 
 static void
@@ -4982,15 +5067,22 @@ ovl_open (fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
   struct ovl_data *lo = ovl_data (req);
   cleanup_lock int l = enter_big_lock ();
   cleanup_close int fd = -1;
+  int flags = 0;
 
+  if(fi->flags&O_WRONLY)
+  {
+    //readOneBlock need the O_RDWR to pread
+    flags = fi->flags&(~O_WRONLY)&(~O_APPEND)|O_RDWR;
+  }
+  
   if (UNLIKELY (ovl_debug (req)))
-    fprintf (stderr, "ovl_open(ino=%" PRIu64 ", flags=%d)\n", ino, fi->flags&(~O_WRONLY)&(~O_APPEND)|O_RDWR);
+    fprintf (stderr, "ovl_open(ino=%" PRIu64 ", flags=%d)\n", ino, flags);
   if (0 == checkSandbox(req->ctx.pid)) {
       fuse_reply_err (req, 1);
       return;
   }
-  //readOneBlock need the O_RDWR to pread
-  fd = ovl_do_open (req, ino, NULL, fi->flags&(~O_WRONLY)&(~O_APPEND)|O_RDWR, 0700, NULL, NULL);
+  
+  fd = ovl_do_open (req, ino, NULL, flags, 0700, NULL, NULL);
   if (fd < 0)
     {
       fuse_reply_err (req, errno);
