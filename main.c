@@ -63,9 +63,6 @@
 
 #include <utils.h>
 #include <plugin.h>
-#include <openssl/evp.h>
-#include <openssl/hmac.h>
-#include <openssl/buffer.h>
 
 #ifndef TEMP_FAILURE_RETRY
 #define TEMP_FAILURE_RETRY(expression) \
@@ -103,45 +100,8 @@ static pthread_mutex_t lock;
 char hostpid[64];
 bool isBoxRunning=false;
 
-struct SSLCipher
-{
-    const EVP_CIPHER *blockCipher;
-    const EVP_CIPHER *streamCipher;
-    unsigned int keySize;  // in bytes
-    unsigned int ivLength;
-};
-
 struct SSLCipher gSSLCipher;
-
-struct SSLKey
-{
-    pthread_mutex_t mutex;
-
-    unsigned int keySize;  // in bytes
-    unsigned int ivLength;
-    // key data is first _keySize bytes,
-    // followed by iv of _ivLength bytes,
-    unsigned char *buffer;
-    
-    EVP_CIPHER_CTX *block_enc;
-    EVP_CIPHER_CTX *block_dec;
-    EVP_CIPHER_CTX *stream_enc;
-    EVP_CIPHER_CTX *stream_dec;
-    
-    HMAC_CTX *mac_ctx;
-};
-
 struct SSLKey gSSLKey;
-
-struct IORequest {
-  int fd;
-  off_t offset;
-
-  // amount of bytes to read/write.
-  size_t dataLen;
-  unsigned char *data;
-};
-struct IORequest gCache;
 
 unsigned int gBlockSize = 1024;
 unsigned int gKeyLen = 256;
@@ -1270,6 +1230,14 @@ node_free (void *p)
   stats.nodes--;
   free (n->name);
   free (n->path);
+
+  EVP_CIPHER_CTX_free(n->block_enc);
+  EVP_CIPHER_CTX_free(n->block_dec);
+  EVP_CIPHER_CTX_free(n->stream_enc);
+  EVP_CIPHER_CTX_free(n->stream_dec);
+
+  pthread_mutex_destroy(&n->mutex);
+  
   free (n);
 }
 
@@ -1710,6 +1678,49 @@ safe_read_xattr (char **ret, int sfd, const char *name, size_t initial_size)
   return s;
 }
 
+void initCipherCtx(struct ovl_node *node)
+{
+    node->block_enc = EVP_CIPHER_CTX_new();
+    EVP_CIPHER_CTX_init(node->block_enc);
+    node->block_dec = EVP_CIPHER_CTX_new();
+    EVP_CIPHER_CTX_init(node->block_dec);
+    node->stream_enc = EVP_CIPHER_CTX_new();
+    EVP_CIPHER_CTX_init(node->stream_enc);
+    node->stream_dec = EVP_CIPHER_CTX_new();
+    EVP_CIPHER_CTX_init(node->stream_dec);
+
+    pthread_mutex_init(&node->mutex, NULL);
+
+    pthread_mutex_lock(&node->mutex);
+
+    // initialize the cipher context once so that we don't have to do it for every block..
+    EVP_EncryptInit_ex(node->block_enc, gSSLCipher.blockCipher, NULL, NULL, NULL);
+    EVP_DecryptInit_ex(node->block_dec, gSSLCipher.blockCipher, NULL, NULL, NULL);
+    EVP_EncryptInit_ex(node->stream_enc, gSSLCipher.streamCipher, NULL, NULL, NULL);
+    EVP_DecryptInit_ex(node->stream_dec, gSSLCipher.streamCipher, NULL, NULL, NULL);
+
+    EVP_CIPHER_CTX_set_key_length(node->block_enc, gSSLKey.keySize);
+    EVP_CIPHER_CTX_set_key_length(node->block_dec, gSSLKey.keySize);
+    EVP_CIPHER_CTX_set_key_length(node->stream_enc, gSSLKey.keySize);
+    EVP_CIPHER_CTX_set_key_length(node->stream_dec, gSSLKey.keySize);
+
+    EVP_CIPHER_CTX_set_padding(node->block_enc, 0);
+    EVP_CIPHER_CTX_set_padding(node->block_dec, 0);
+    EVP_CIPHER_CTX_set_padding(node->stream_enc, 0);
+    EVP_CIPHER_CTX_set_padding(node->stream_dec, 0);
+
+    EVP_EncryptInit_ex(node->block_enc, NULL, NULL, gSSLKey.buffer, NULL);
+    EVP_DecryptInit_ex(node->block_dec, NULL, NULL, gSSLKey.buffer, NULL);
+    EVP_EncryptInit_ex(node->stream_enc, NULL, NULL, gSSLKey.buffer, NULL);
+    EVP_DecryptInit_ex(node->stream_dec, NULL, NULL, gSSLKey.buffer, NULL);
+
+    node->cache.data = (unsigned char *)malloc(gBlockSize);
+    memset(node->cache.data, 0, gBlockSize);
+
+    pthread_mutex_unlock(&node->mutex);
+}
+
+
 static struct ovl_node *
 make_ovl_node (struct ovl_data *lo, const char *path, struct ovl_layer *layer, const char *name, ino_t ino, dev_t dev, bool dir_p, struct ovl_node *parent, bool fast_ino_check)
 {
@@ -1732,6 +1743,7 @@ make_ovl_node (struct ovl_data *lo, const char *path, struct ovl_layer *layer, c
   ret->next_link = NULL;
   ret->ino = NULL;
   ret->node_lookups = 0;
+  initCipherCtx(ret);
 
   new_name = strdup (name);
   if (new_name == NULL)
@@ -4113,31 +4125,31 @@ static void unshuffleBytes(unsigned char *buf, int size)
 /** Partial blocks are encoded with a stream cipher.  We make multiple passes on
  the data to ensure that the ends of the data depend on each other.
 */
-bool streamEncode(fuse_req_t req, unsigned char *buf, int size, uint64_t iv64)
+bool streamEncode(fuse_req_t req, struct ovl_node *node, unsigned char *buf, int size, uint64_t iv64)
 {
   unsigned char ivec[MAX_IVLENGTH];
   int dstLen = 0, tmpLen = 0;
 
-  pthread_mutex_lock(&gSSLKey.mutex);
+  pthread_mutex_lock(&node->mutex);
 
   shuffleBytes(buf, size);
 
   setIVec(ivec, iv64);
-  EVP_EncryptInit_ex(gSSLKey.stream_enc, NULL, NULL, NULL, ivec);
-  EVP_EncryptUpdate(gSSLKey.stream_enc, buf, &dstLen, buf, size);
-  EVP_EncryptFinal_ex(gSSLKey.stream_enc, buf + dstLen, &tmpLen);
+  EVP_EncryptInit_ex(node->stream_enc, NULL, NULL, NULL, ivec);
+  EVP_EncryptUpdate(node->stream_enc, buf, &dstLen, buf, size);
+  EVP_EncryptFinal_ex(node->stream_enc, buf + dstLen, &tmpLen);
 
   flipBytes(buf, size);
   shuffleBytes(buf, size);
 
   setIVec(ivec, iv64 + 1);
-  EVP_EncryptInit_ex(gSSLKey.stream_enc, NULL, NULL, NULL, ivec);
-  EVP_EncryptUpdate(gSSLKey.stream_enc, buf, &dstLen, buf, size);
-  EVP_EncryptFinal_ex(gSSLKey.stream_enc, buf + dstLen, &tmpLen);
+  EVP_EncryptInit_ex(node->stream_enc, NULL, NULL, NULL, ivec);
+  EVP_EncryptUpdate(node->stream_enc, buf, &dstLen, buf, size);
+  EVP_EncryptFinal_ex(node->stream_enc, buf + dstLen, &tmpLen);
 
   dstLen += tmpLen;
 
-  pthread_mutex_unlock(&gSSLKey.mutex);
+  pthread_mutex_unlock(&node->mutex);
   if (dstLen != size)
   {
     if (UNLIKELY (ovl_debug (req)))
@@ -4150,30 +4162,30 @@ bool streamEncode(fuse_req_t req, unsigned char *buf, int size, uint64_t iv64)
   return true;
 }
 
-bool streamDecode(fuse_req_t req, unsigned char *buf, int size, uint64_t iv64)
+bool streamDecode(fuse_req_t req, struct ovl_node *node, unsigned char *buf, int size, uint64_t iv64)
 {
   unsigned char ivec[MAX_IVLENGTH];
   int dstLen = 0, tmpLen = 0;
 
-  pthread_mutex_lock(&gSSLKey.mutex);
+  pthread_mutex_lock(&node->mutex);
 
   setIVec(ivec, iv64 + 1);
-  EVP_DecryptInit_ex(gSSLKey.stream_dec, NULL, NULL, NULL, ivec);
-  EVP_DecryptUpdate(gSSLKey.stream_dec, buf, &dstLen, buf, size);
-  EVP_DecryptFinal_ex(gSSLKey.stream_dec, buf + dstLen, &tmpLen);
+  EVP_DecryptInit_ex(node->stream_dec, NULL, NULL, NULL, ivec);
+  EVP_DecryptUpdate(node->stream_dec, buf, &dstLen, buf, size);
+  EVP_DecryptFinal_ex(node->stream_dec, buf + dstLen, &tmpLen);
 
   unshuffleBytes(buf, size);
   flipBytes(buf, size);
 
   setIVec(ivec, iv64);
-  EVP_DecryptInit_ex(gSSLKey.stream_dec, NULL, NULL, NULL, ivec);
-  EVP_DecryptUpdate(gSSLKey.stream_dec, buf, &dstLen, buf, size);
-  EVP_DecryptFinal_ex(gSSLKey.stream_dec, buf + dstLen, &tmpLen);
+  EVP_DecryptInit_ex(node->stream_dec, NULL, NULL, NULL, ivec);
+  EVP_DecryptUpdate(node->stream_dec, buf, &dstLen, buf, size);
+  EVP_DecryptFinal_ex(node->stream_dec, buf + dstLen, &tmpLen);
 
   unshuffleBytes(buf, size);
   dstLen += tmpLen;
 
-  pthread_mutex_unlock(&gSSLKey.mutex);
+  pthread_mutex_unlock(&node->mutex);
   
   if (dstLen != size)
   {
@@ -4187,13 +4199,13 @@ bool streamDecode(fuse_req_t req, unsigned char *buf, int size, uint64_t iv64)
   return true;
 }
 
-bool blockEncode(fuse_req_t req, unsigned char *buf, int size, uint64_t iv64)
+bool blockEncode(fuse_req_t req, struct ovl_node *node, unsigned char *buf, int size, uint64_t iv64)
 {
   unsigned char ivec[MAX_IVLENGTH];
   int dstLen = 0, tmpLen = 0;
 
   // data must be integer number of blocks
-  const int blockMod = size % EVP_CIPHER_CTX_block_size(gSSLKey.block_enc);
+  const int blockMod = size % EVP_CIPHER_CTX_block_size(node->block_enc);
   if (blockMod != 0) {
     if (UNLIKELY (ovl_debug (req)))
     {
@@ -4202,15 +4214,15 @@ bool blockEncode(fuse_req_t req, unsigned char *buf, int size, uint64_t iv64)
     return false;
   }
 
-  pthread_mutex_lock(&gSSLKey.mutex);
+  pthread_mutex_lock(&node->mutex);
   setIVec(ivec, iv64);
 
-  EVP_EncryptInit_ex(gSSLKey.block_enc, NULL, NULL, NULL, ivec);
-  EVP_EncryptUpdate(gSSLKey.block_enc, buf, &dstLen, buf, size);
-  EVP_EncryptFinal_ex(gSSLKey.block_enc, buf + dstLen, &tmpLen);
+  EVP_EncryptInit_ex(node->block_enc, NULL, NULL, NULL, ivec);
+  EVP_EncryptUpdate(node->block_enc, buf, &dstLen, buf, size);
+  EVP_EncryptFinal_ex(node->block_enc, buf + dstLen, &tmpLen);
   dstLen += tmpLen;
 
-  pthread_mutex_unlock(&gSSLKey.mutex);
+  pthread_mutex_unlock(&node->mutex);
 
   if (dstLen != size)
   {
@@ -4224,13 +4236,13 @@ bool blockEncode(fuse_req_t req, unsigned char *buf, int size, uint64_t iv64)
   return true;
 }
 
-bool blockDecode(fuse_req_t req, unsigned char *buf, int size, uint64_t iv64)
+bool blockDecode(fuse_req_t req, struct ovl_node *node, unsigned char *buf, int size, uint64_t iv64)
 {
   unsigned char ivec[MAX_IVLENGTH];
   int dstLen = 0, tmpLen = 0;
 
   // data must be integer number of blocks
-  const int blockMod = size % EVP_CIPHER_CTX_block_size(gSSLKey.block_dec);
+  const int blockMod = size % EVP_CIPHER_CTX_block_size(node->block_dec);
   if (blockMod != 0) {
     if (UNLIKELY (ovl_debug (req)))
     {
@@ -4239,15 +4251,15 @@ bool blockDecode(fuse_req_t req, unsigned char *buf, int size, uint64_t iv64)
     return false;
   }
 
-  pthread_mutex_lock(&gSSLKey.mutex);
+  pthread_mutex_lock(&node->mutex);
   setIVec(ivec, iv64);
 
-  EVP_DecryptInit_ex(gSSLKey.block_dec, NULL, NULL, NULL, ivec);
-  EVP_DecryptUpdate(gSSLKey.block_dec, buf, &dstLen, buf, size);
-  EVP_DecryptFinal_ex(gSSLKey.block_dec, buf + dstLen, &tmpLen);
+  EVP_DecryptInit_ex(node->block_dec, NULL, NULL, NULL, ivec);
+  EVP_DecryptUpdate(node->block_dec, buf, &dstLen, buf, size);
+  EVP_DecryptFinal_ex(node->block_dec, buf + dstLen, &tmpLen);
   dstLen += tmpLen;
 
-  pthread_mutex_unlock(&gSSLKey.mutex);
+  pthread_mutex_unlock(&node->mutex);
 
   if (dstLen != size)
   {
@@ -4299,7 +4311,7 @@ void printhex(unsigned char *src,int len)
  * or
  * Read block from backing plaintext file, then encrypt it (reverse mode)
  */
-ssize_t readOneBlock(fuse_req_t req, const struct IORequest *blockReq)
+ssize_t readOneBlock(fuse_req_t req, struct ovl_node *node, const struct IORequest *blockReq)
 {
   bool ok;
   int i = 0;
@@ -4326,7 +4338,7 @@ ssize_t readOneBlock(fuse_req_t req, const struct IORequest *blockReq)
   {
     if (readSize != gBlockSize)
     {
-      ok = streamDecode(req, blockReq->data, (int)readSize, blockNum ^ 0);
+      ok = streamDecode(req, node, blockReq->data, (int)readSize, blockNum ^ 0);
       // cast works because we work on a block and blocksize fit an int
     }
     else
@@ -4335,14 +4347,14 @@ ssize_t readOneBlock(fuse_req_t req, const struct IORequest *blockReq)
         // special case - leave all 0's alone
         for (i = 0; i < readSize; ++i) {
           if (blockReq->data[i] != 0) {
-            ok = blockDecode(req, blockReq->data, (int)readSize, blockNum ^ 0);
+            ok = blockDecode(req, node, blockReq->data, (int)readSize, blockNum ^ 0);
             break;
           }
         }
       }
       else
       {
-        ok = blockDecode(req, blockReq->data, (int)readSize, blockNum ^ 0);
+        ok = blockDecode(req, node, blockReq->data, (int)readSize, blockNum ^ 0);
       }
     }
 
@@ -4372,7 +4384,7 @@ ssize_t readOneBlock(fuse_req_t req, const struct IORequest *blockReq)
   return readSize;
 }
 
-ssize_t writeOneBlock(fuse_req_t req, const struct IORequest *blockReq)
+ssize_t writeOneBlock(fuse_req_t req, struct ovl_node *node, const struct IORequest *blockReq)
 {
     bool ok;
     ssize_t res = 0;
@@ -4382,10 +4394,10 @@ ssize_t writeOneBlock(fuse_req_t req, const struct IORequest *blockReq)
     off_t blockNum = blockReq->offset / gBlockSize;
 
     if (blockReq->dataLen != gBlockSize) {
-        ok = streamEncode(req, blockReq->data, (int)blockReq->dataLen, blockNum ^ 0);
+        ok = streamEncode(req, node, blockReq->data, (int)blockReq->dataLen, blockNum ^ 0);
         // cast works because we work on a block and blocksize fit an int
     } else {
-        ok = blockEncode(req, blockReq->data, (int)blockReq->dataLen, blockNum ^ 0);
+        ok = blockEncode(req, node, blockReq->data, (int)blockReq->dataLen, blockNum ^ 0);
         // cast works because we work on a block and blocksize fit an int
     }
     
@@ -4446,46 +4458,46 @@ static void clearCache(struct IORequest *req, unsigned int blockSize)
  * Always requests full blocks form the lower layer, truncates the
  * returned data as neccessary.
  */
-ssize_t cacheReadOneBlock(fuse_req_t req, const struct IORequest *blockReq)
+ssize_t cacheReadOneBlock(fuse_req_t req, struct ovl_node *node, const struct IORequest *blockReq)
 {
   /* we can satisfy the request even if _cache.dataLen is too short, because
    * we always request a full block during reads. This just means we are
    * in the last block of a file, which may be smaller than the blocksize.
    * For reverse encryption, the cache must not be used at all, because
    * the lower file may have changed behind our back. */
-  if ((blockReq->offset == gCache.offset) && (gCache.dataLen != 0)) {
+  if ((blockReq->offset == node->cache.offset) && (node->cache.dataLen != 0)) {
     // satisfy request from cache
     if (UNLIKELY (ovl_debug (req)))
     {
-      fprintf(stderr, "Read from cache offset=%d, dataLen=%d\n", gCache.offset, gCache.dataLen);
+      fprintf(stderr, "Read from cache offset=%d, dataLen=%d\n", node->cache.offset, node->cache.dataLen);
     }
     size_t len = blockReq->dataLen;
-    if (gCache.dataLen < len) {
-      len = gCache.dataLen;  // Don't read past EOF
+    if (node->cache.dataLen < len) {
+      len = node->cache.dataLen;  // Don't read past EOF
     }
-    memcpy(blockReq->data, gCache.data, len);
+    memcpy(blockReq->data, node->cache.data, len);
     return len;
   }
   
-  if (gCache.dataLen > 0)
+  if (node->cache.dataLen > 0)
   {
-    clearCache(&gCache, gBlockSize);
+    clearCache(&node->cache, gBlockSize);
   }
 
   // cache results of read -- issue reads for full blocks
   struct IORequest tmp;
   tmp.fd = blockReq->fd;
   tmp.offset = blockReq->offset;
-  tmp.data = gCache.data;
+  tmp.data = node->cache.data;
   tmp.dataLen = gBlockSize;
-  ssize_t result = readOneBlock(req, &tmp);
+  ssize_t result = readOneBlock(req, node, &tmp);
   if (result > 0) {
-    gCache.offset = blockReq->offset;
-    gCache.dataLen = result;  // the amount we really have
+    node->cache.offset = blockReq->offset;
+    node->cache.dataLen = result;  // the amount we really have
     if ((size_t)result > blockReq->dataLen) {
       result = blockReq->dataLen;  // only as much as requested
     }
-    memcpy(blockReq->data, gCache.data, result);
+    memcpy(blockReq->data, node->cache.data, result);
     if (UNLIKELY (ovl_debug (req)))
     {
       fprintf(stderr, "cacheReadOneBlock save cache: offset=%d, dataLen=%d\n", blockReq->offset, blockReq->dataLen);
@@ -4494,25 +4506,25 @@ ssize_t cacheReadOneBlock(fuse_req_t req, const struct IORequest *blockReq)
   return result;
 }
 
-ssize_t cacheWriteOneBlock(fuse_req_t req, const struct IORequest *blockReq)
+ssize_t cacheWriteOneBlock(fuse_req_t req, struct ovl_node *node, const struct IORequest *blockReq)
 {
   // Let's point request buffer to our own buffer, as it may be modified by
   // encryption : originating process may not like to have its buffer modified
-  memcpy(gCache.data, blockReq->data, blockReq->dataLen);
+  memcpy(node->cache.data, blockReq->data, blockReq->dataLen);
   struct IORequest tmp;
   tmp.fd = blockReq->fd;
   tmp.offset = blockReq->offset;
-  tmp.data = gCache.data;
+  tmp.data = node->cache.data;
   tmp.dataLen = blockReq->dataLen;
-  ssize_t res = writeOneBlock(req, &tmp);
+  ssize_t res = writeOneBlock(req, node, &tmp);
   if (res < 0) {
-    clearCache(&gCache, gBlockSize);
+    clearCache(&node->cache, gBlockSize);
   }
   else {
     // And now we can cache the write buffer from the request
-    memcpy(gCache.data, blockReq->data, blockReq->dataLen);
-    gCache.offset = blockReq->offset;
-    gCache.dataLen = blockReq->dataLen;
+    memcpy(node->cache.data, blockReq->data, blockReq->dataLen);
+    node->cache.offset = blockReq->offset;
+    node->cache.dataLen = blockReq->dataLen;
     if (UNLIKELY (ovl_debug (req)))
     {
       fprintf(stderr, "cacheWriteOneBlock save cache: offset=%d, dataLen=%d\n", blockReq->offset, blockReq->dataLen);
@@ -4521,7 +4533,7 @@ ssize_t cacheWriteOneBlock(fuse_req_t req, const struct IORequest *blockReq)
   return res;
 }
 
-ssize_t readBlocks(fuse_req_t req, const struct IORequest *blockReq)
+ssize_t readBlocks(fuse_req_t req, struct ovl_node *node, const struct IORequest *blockReq)
 {
     int partialOffset = blockReq->offset % gBlockSize;  // can be int as _blockSize is int
     off_t blockNum = blockReq->offset / gBlockSize;
@@ -4531,7 +4543,7 @@ ssize_t readBlocks(fuse_req_t req, const struct IORequest *blockReq)
     if (partialOffset == 0 && blockReq->dataLen <= gBlockSize)
     {
         // read completely within a single block -- can be handled as-is by readOneBlock().
-        return cacheReadOneBlock(req, blockReq);
+        return cacheReadOneBlock(req, node, blockReq);
     }
     size_t size = blockReq->dataLen;
 
@@ -4566,7 +4578,7 @@ ssize_t readBlocks(fuse_req_t req, const struct IORequest *blockReq)
             tmp.data = (unsigned char *)(data->data);
         }
 
-        ssize_t readSize = cacheReadOneBlock(req, &tmp);
+        ssize_t readSize = cacheReadOneBlock(req, node, &tmp);
         if (readSize < 0) {
             result = readSize;
             break;
@@ -4601,7 +4613,7 @@ ssize_t readBlocks(fuse_req_t req, const struct IORequest *blockReq)
     return result;
 }
 
-int padFile(fuse_req_t req, int fd, off_t oldSize, off_t newSize, bool forceWrite)
+int padFile(fuse_req_t req, struct ovl_node *node, int fd, off_t oldSize, off_t newSize, bool forceWrite)
 {
   struct IORequest blockReq;
   ssize_t res = 0;
@@ -4639,9 +4651,9 @@ int padFile(fuse_req_t req, int fd, off_t oldSize, off_t newSize, bool forceWrit
         fprintf (stderr, "padding block %d\n", oldLastBlock);
       }
       memset(data, 0, gBlockSize);
-      if ((res = cacheReadOneBlock(req, &blockReq)) >= 0) {
+      if ((res = cacheReadOneBlock(req, node, &blockReq)) >= 0) {
         blockReq.dataLen = gBlockSize;  // expand to full block size
-        res = cacheWriteOneBlock(req, &blockReq);
+        res = cacheWriteOneBlock(req, node, &blockReq);
       }
       ++oldLastBlock;
     }
@@ -4656,7 +4668,7 @@ int padFile(fuse_req_t req, int fd, off_t oldSize, off_t newSize, bool forceWrit
         blockReq.offset = oldLastBlock * gBlockSize;
         blockReq.dataLen = gBlockSize;
         memset(data, 0, blockReq.dataLen);
-        res = cacheWriteOneBlock(req, &blockReq);
+        res = cacheWriteOneBlock(req, node, &blockReq);
       }
     }
 
@@ -4665,7 +4677,7 @@ int padFile(fuse_req_t req, int fd, off_t oldSize, off_t newSize, bool forceWrit
       blockReq.offset = newLastBlock * gBlockSize;
       blockReq.dataLen = newBlockSize;
       memset(data, 0, blockReq.dataLen);
-      res = cacheWriteOneBlock(req, &blockReq);
+      res = cacheWriteOneBlock(req, node, &blockReq);
     }
   }
 
@@ -4682,7 +4694,7 @@ int padFile(fuse_req_t req, int fd, off_t oldSize, off_t newSize, bool forceWrit
 /**
  * Returns the number of bytes written, or -errno in case of failure.
  */
-ssize_t writeBlocks(fuse_req_t req, off_t fileSize, const struct IORequest *blockReq)
+ssize_t writeBlocks(fuse_req_t req, struct ovl_node *node, off_t fileSize, const struct IORequest *blockReq)
 {
   BUF_MEM *data = NULL;
   
@@ -4706,7 +4718,7 @@ ssize_t writeBlocks(fuse_req_t req, off_t fileSize, const struct IORequest *bloc
 
   if (blockReq->offset > fileSize) {
     // extend file first to fill hole with 0's..
-    int res = padFile(req, blockReq->fd, fileSize, blockReq->offset, false);
+    int res = padFile(req, node, blockReq->fd, fileSize, blockReq->offset, false);
     if (res < 0) {
       return res;
     }
@@ -4716,12 +4728,12 @@ ssize_t writeBlocks(fuse_req_t req, off_t fileSize, const struct IORequest *bloc
   if (partialOffset == 0 && blockReq->dataLen <= gBlockSize) {
     // if writing a full block.. pretty safe..
     if (blockReq->dataLen == gBlockSize) {
-      return cacheWriteOneBlock(req, blockReq);
+      return cacheWriteOneBlock(req, node, blockReq);
     }
 
     // if writing a partial block, but at least as much as what is already there..
     if (blockNum == lastFileBlock && blockReq->dataLen >= lastBlockSize) {
-      return cacheWriteOneBlock(req, blockReq);
+      return cacheWriteOneBlock(req, node, blockReq);
     }
   }
 
@@ -4760,7 +4772,7 @@ ssize_t writeBlocks(fuse_req_t req, off_t fileSize, const struct IORequest *bloc
       } else {
         // have to merge with existing block data..
         tmp.dataLen = gBlockSize;
-        ssize_t readSize = cacheReadOneBlock(req, &tmp);
+        ssize_t readSize = cacheReadOneBlock(req, node, &tmp);
         if (readSize < 0) {
           res = readSize;
           break;
@@ -4777,7 +4789,7 @@ ssize_t writeBlocks(fuse_req_t req, off_t fileSize, const struct IORequest *bloc
     }
 
     // Finally, write the damn thing!
-    res = cacheWriteOneBlock(req, &tmp);
+    res = cacheWriteOneBlock(req, node, &tmp);
     if (res < 0) {
       break;
     }
@@ -4816,7 +4828,7 @@ static void ovl_read (fuse_req_t req, fuse_ino_t ino, size_t size,
 
     fprintf (stderr, "path=%s name=%s layer=%p last_layer=%p lower=%p upper=%p\n", node->path, node->name, node->layer, node->last_layer, get_lower_layers (lo), get_upper_layer (lo));
 
-    if (node->last_layer == get_upper_layer (lo))
+    if (node->layer == get_upper_layer (lo) || node->last_layer == get_upper_layer (lo))
     {
         buffer = (char *)malloc(size);
         memset(buffer, 0 , size);
@@ -4826,7 +4838,7 @@ static void ovl_read (fuse_req_t req, fuse_ino_t ino, size_t size,
         blockReq.dataLen = size;
         blockReq.data = buffer;
         pthread_mutex_lock (&lock);
-        readBlocks(req, &blockReq);
+        readBlocks(req, node, &blockReq);
         pthread_mutex_unlock (&lock);
 
         if (UNLIKELY (ovl_debug (req)))
@@ -4880,7 +4892,8 @@ static void ovl_write_buf (fuse_req_t req, fuse_ino_t ino,
             ino, out_buf.buf[0].size, (unsigned long) off, (int) fi->fh);
     }
 
-    if (node->last_layer == get_upper_layer (lo))
+    node = inode_to_node (lo, ino);
+    if (node->layer == get_upper_layer (lo) || node->last_layer == get_upper_layer (lo))
     {
 
         buf = &in_buf->buf[0];
@@ -4910,7 +4923,7 @@ static void ovl_write_buf (fuse_req_t req, fuse_ino_t ino,
           return;
         }
 
-        res = writeBlocks(req, s.st_size, &blockReq);
+        res = writeBlocks(req, node, s.st_size, &blockReq);
         saved_errno = errno;
         pthread_mutex_unlock (&lock);
     }
@@ -6827,41 +6840,10 @@ void newAESCipher(   int keyLen)
     gSSLCipher.ivLength = EVP_CIPHER_iv_length(blockCipher);
 }
 
-void initKey(struct SSLKey *key, const EVP_CIPHER *blockCipher, const EVP_CIPHER *streamCipher, int keySize)
-{
-    pthread_mutex_lock(&key->mutex);
-
-    // initialize the cipher context once so that we don't have to do it for
-    // every block..
-    EVP_EncryptInit_ex(key->block_enc, blockCipher, NULL, NULL, NULL);
-    EVP_DecryptInit_ex(key->block_dec, blockCipher, NULL, NULL, NULL);
-    EVP_EncryptInit_ex(key->stream_enc, streamCipher, NULL, NULL, NULL);
-    EVP_DecryptInit_ex(key->stream_dec, streamCipher, NULL, NULL, NULL);
-
-    EVP_CIPHER_CTX_set_key_length(key->block_enc, keySize);
-    EVP_CIPHER_CTX_set_key_length(key->block_dec, keySize);
-    EVP_CIPHER_CTX_set_key_length(key->stream_enc, keySize);
-    EVP_CIPHER_CTX_set_key_length(key->stream_dec, keySize);
-
-    EVP_CIPHER_CTX_set_padding(key->block_enc, 0);
-    EVP_CIPHER_CTX_set_padding(key->block_dec, 0);
-    EVP_CIPHER_CTX_set_padding(key->stream_enc, 0);
-    EVP_CIPHER_CTX_set_padding(key->stream_dec, 0);
-
-    EVP_EncryptInit_ex(key->block_enc, NULL, NULL, key->buffer, NULL);
-    EVP_DecryptInit_ex(key->block_dec, NULL, NULL, key->buffer, NULL);
-    EVP_EncryptInit_ex(key->stream_enc, NULL, NULL, key->buffer, NULL);
-    EVP_DecryptInit_ex(key->stream_dec, NULL, NULL, key->buffer, NULL);
-
-    HMAC_Init_ex(key->mac_ctx, key->buffer, keySize, EVP_sha1(), NULL);
-
-    pthread_mutex_unlock(&key->mutex);
-}
-
 void newKey(const char *password, int passwdLength, int keySize, int ivLength) {
     gSSLKey.keySize = keySize;
     gSSLKey.ivLength = ivLength;
-    pthread_mutex_init(&gSSLKey.mutex, NULL);
+    
     gSSLKey.buffer = (unsigned char *)OPENSSL_malloc(gSSLKey.keySize + gSSLKey.ivLength);
     memset(gSSLKey.buffer, 0, (size_t)gSSLKey.keySize + (size_t)gSSLKey.ivLength);
 
@@ -6869,6 +6851,7 @@ void newKey(const char *password, int passwdLength, int keySize, int ivLength) {
     // kernel patch is applied..
     //mlock(buffer, (size_t)gSSLKey.keySize + (size_t)gSSLKey.ivLength);
 
+    /*
     gSSLKey.block_enc = EVP_CIPHER_CTX_new();
     EVP_CIPHER_CTX_init(gSSLKey.block_enc);
     gSSLKey.block_dec = EVP_CIPHER_CTX_new();
@@ -6877,6 +6860,7 @@ void newKey(const char *password, int passwdLength, int keySize, int ivLength) {
     EVP_CIPHER_CTX_init(gSSLKey.stream_enc);
     gSSLKey.stream_dec = EVP_CIPHER_CTX_new();
     EVP_CIPHER_CTX_init(gSSLKey.stream_dec);
+    %*/
     
     gSSLKey.mac_ctx = (HMAC_CTX *)OPENSSL_malloc(sizeof(HMAC_CTX));
     if (gSSLKey.mac_ctx != NULL) {
@@ -6885,9 +6869,8 @@ void newKey(const char *password, int passwdLength, int keySize, int ivLength) {
     }
 
     EVP_BytesToKey(gSSLCipher.blockCipher, EVP_sha1(), NULL, password, passwdLength, 16, gSSLKey.buffer, gSSLKey.buffer+gSSLKey.keySize);
-    initKey(&gSSLKey, gSSLCipher.blockCipher, gSSLCipher.streamCipher, keySize);
 
-    fprintf (stderr, "keySize=%d, ivLength=%d\n", gSSLKey.keySize, gSSLKey.ivLength);
+    HMAC_Init_ex(gSSLKey.mac_ctx, gSSLKey.buffer, keySize, EVP_sha1(), NULL);
 }
 
 int main (int argc, char *argv[])
@@ -6926,8 +6909,6 @@ int main (int argc, char *argv[])
 
   newAESCipher(gKeyLen);
   newKey(password, strlen(password), gSSLCipher.keySize, gSSLCipher.ivLength);
-  gCache.data = (unsigned char *)malloc(gBlockSize);
-  memset(gCache.data, 0, gBlockSize);
   
   memset (&opts, 0, sizeof (opts));
   if (fuse_opt_parse (&args, &lo, ovl_opts, fuse_opt_proc) == -1)
@@ -7160,6 +7141,12 @@ err_out1:
   close (lo.workdir_fd);
 
   fuse_opt_free_args (&args);
+
+  OPENSSL_free(gSSLKey.buffer);
+  if (gSSLKey.mac_ctx != NULL) {
+    HMAC_CTX_cleanup(gSSLKey.mac_ctx);
+    OPENSSL_free(gSSLKey.mac_ctx);
+  }
 
   exit (ret ? EXIT_FAILURE : EXIT_SUCCESS);
   return 1;
