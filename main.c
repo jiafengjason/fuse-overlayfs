@@ -109,6 +109,12 @@ bool gAllowHoles = true;
 
 const int MAX_IVLENGTH = 16;   // 128 bit (AES block size, Blowfish has 64)
 
+static pid_t gOvlPid = 0;
+static pid_t gManagePid = 0;
+
+#define MAX_PATH_STR  1024
+#define INVALID_PID -1
+
 static int
 enter_big_lock ()
 {
@@ -880,6 +886,7 @@ delete_whiteout (struct ovl_data *lo, int dirfd, struct ovl_node *parent, const 
   return 0;
 }
 
+/*
 int getParentPid(int pid, int *decision)
 {
     char dir[1024]={0};
@@ -941,8 +948,7 @@ int getParentPid(int pid, int *decision)
     return rpid;
 }
 
-/*�жϵ�ǰ���ʽ�������host����guest
-static int checkSandbox(int pid_guest) {
+static int checkAuthority(int pid_guest) {
     //int decision = 0;
     char guestpid[64];
     char path[64];
@@ -979,11 +985,77 @@ static int checkSandbox(int pid_guest) {
 }
 */
 
-int checkSandbox(int pid_guest) 
+int isInBox(fuse_req_t req, pid_t pid)
 {
-    return 1;
+    char statPath[MAX_PATH_STR] = {0};
+    char buf[MAX_PATH_STR] = {0};
+    char procName[MAX_PATH_STR]={0};
+    pid_t fpid=0;
+    struct stat st;
+    ssize_t ret =0;
+
+    while(1)
+    {
+        sprintf(statPath,"/proc/%d/stat",pid);
+
+        if(stat(statPath,&st)!=0)
+        {
+            return false;
+        }
+
+        FILE * fp = fopen(statPath,"r");
+        ret += fread(buf + ret,1,300-ret,fp);
+        fclose(fp);
+
+        sscanf(buf,"%*d %*c%s %*c %d %*s",procName,&fpid);
+        procName[strlen(procName)-1]='\0';
+
+        if(fpid==gManagePid)
+        {
+            return true;
+        }
+        
+        /*
+        if(strncmp(procName, "firejail", strlen("firejail"))==0)
+        {
+            return true;
+        }
+        */
+        
+        pid = fpid;
+        memset(statPath,0,strlen(statPath));
+        memset(buf,0,strlen(buf));
+        memset(procName,0,strlen(procName));
+        ret = 0;
+
+        //systemd
+        if(pid==1)
+        {
+            return false;
+        }
+        //kthreadd
+        if(pid==2)
+        {
+            return false;
+        }
+    }
+
+    return false;
 }
 
+static int checkAuthority(fuse_req_t req) 
+{
+    int fpid = 0;
+
+    if (UNLIKELY (ovl_debug (req)))
+    {
+        fprintf (stderr, "checkAuthority(pid=%d gManagePid=%d)\n", req->ctx.pid, gManagePid);
+    }
+
+    return isInBox(req, req->ctx.pid)?1:0;
+}
+
+//防止死循环挂载
 int checkPath(struct ovl_data *lo, char *path) 
 {
     char *dirc;
@@ -1544,8 +1616,8 @@ ovl_forget (fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
   cleanup_lock int l = enter_big_lock ();
   struct ovl_data *lo = ovl_data (req);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
   if (UNLIKELY (ovl_debug (req)))
@@ -1566,8 +1638,8 @@ ovl_forget_multi (fuse_req_t req, size_t count, struct fuse_forget_data *forgets
     fprintf (stderr, "ovl_forget_multi(count=%zu, forgets=%p)\n",
 	     count, forgets);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
 
@@ -1981,11 +2053,11 @@ load_dir (struct ovl_data *lo, struct ovl_node *n, struct ovl_layer *layer, char
       if (ret == 0)
         break;
 
-      if (checkPath(lo, path)==0)
+      if (0 == checkPath(lo, path))
       {
           continue;
       }
-
+      
       dp = it->ds->opendir (it, path);
       if (dp == NULL)
         continue;
@@ -2300,7 +2372,7 @@ do_lookup_file (fuse_req_t req, struct ovl_data *lo, fuse_ino_t parent, const ch
   else
     pnode = inode_to_node (lo, parent);
   
-  if (0 == checkAccess(req, lo, pnode->path)) {
+  if (0 == checkPath(lo, pnode->path)) {
     return NULL;
   }
 
@@ -2433,8 +2505,8 @@ ovl_lookup (fuse_req_t req, fuse_ino_t parent, const char *name)
     fprintf (stderr, "ovl_lookup(parent=%" PRIu64 ", name=%s)\n",
 	     parent, name);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
   memset (&e, 0, sizeof (e));
@@ -2535,8 +2607,8 @@ ovl_opendir (fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_opendir(ino=%" PRIu64 ")\n", ino);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
 
@@ -2713,7 +2785,7 @@ ovl_do_readdir (fuse_req_t req, fuse_ino_t ino, size_t size,
             name = node->name;
           }
 
-        if (0 == checkAccess(req, lo, node->path)) {
+        if (0 == checkPath(lo, node->path)) {
           continue;
         }
   
@@ -2773,8 +2845,8 @@ ovl_readdir (fuse_req_t req, fuse_ino_t ino, size_t size,
 	    off_t offset, struct fuse_file_info *fi)
 {
   cleanup_lock int l = enter_big_lock ();
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
   if (UNLIKELY (ovl_debug (req)))
@@ -2787,8 +2859,8 @@ ovl_readdirplus (fuse_req_t req, fuse_ino_t ino, size_t size,
 		off_t offset, struct fuse_file_info *fi)
 {
   cleanup_lock int l = enter_big_lock ();
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
   if (UNLIKELY (ovl_debug (req)))
@@ -2808,8 +2880,8 @@ ovl_releasedir (fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_releasedir(ino=%" PRIu64 ")\n", ino);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
   for (s = 2; s < d->tbl_size; s++)
@@ -2879,8 +2951,8 @@ ovl_listxattr (fuse_req_t req, fuse_ino_t ino, size_t size)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_listxattr(ino=%" PRIu64 ", size=%zu)\n", ino, size);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
 
@@ -2942,8 +3014,8 @@ ovl_getxattr (fuse_req_t req, fuse_ino_t ino, const char *name, size_t size)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_getxattr(ino=%" PRIu64 ", name=%s, size=%zu)\n", ino, name, size);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
 
@@ -3010,8 +3082,8 @@ ovl_access (fuse_req_t req, fuse_ino_t ino, int mask)
     fprintf (stderr, "ovl_access(ino=%" PRIu64 ", mask=%d)\n",
 	     ino, mask);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
   if ((mask & n->ino->mode) == mask)
@@ -3686,8 +3758,8 @@ static void
 ovl_unlink (fuse_req_t req, fuse_ino_t parent, const char *name)
 {
   cleanup_lock int l = enter_big_lock ();
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
 
@@ -3701,8 +3773,8 @@ static void
 ovl_rmdir (fuse_req_t req, fuse_ino_t parent, const char *name)
 {
   cleanup_lock int l = enter_big_lock ();
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
 
@@ -3743,8 +3815,8 @@ ovl_setxattr (fuse_req_t req, fuse_ino_t ino, const char *name,
     fprintf (stderr, "ovl_setxattr(ino=%" PRIu64 ", name=%s, value=%s, size=%zu, flags=%d)\n", ino, name,
              value, size, flags);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
 
@@ -3820,8 +3892,8 @@ ovl_removexattr (fuse_req_t req, fuse_ino_t ino, const char *name)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_removexattr(ino=%" PRIu64 ", name=%s)\n", ino, name);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
 
@@ -5040,8 +5112,8 @@ ovl_create (fuse_req_t req, fuse_ino_t parent, const char *name,
       fuse_reply_err (req, ENAMETOOLONG);
       return;
     }
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
   fi->flags = fi->flags | O_CREAT;
@@ -5090,8 +5162,8 @@ ovl_open (fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
   
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_open(ino=%" PRIu64 ", flags=%d)\n", ino, flags);
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
   
@@ -5119,10 +5191,11 @@ ovl_getattr (fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_getattr(ino=%" PRIu64 ")\n", ino);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
+  
   node = do_lookup_file (req, lo, ino, NULL);
   if (node == NULL || node->whiteout)
     {
@@ -5157,8 +5230,8 @@ ovl_setattr (fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to_set, stru
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_setattr(ino=%" PRIu64 ", to_set=%d)\n", ino, to_set);
   
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
   node = do_lookup_file (req, lo, ino, NULL);
@@ -5347,8 +5420,8 @@ ovl_link (fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent, const char *newn
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_link(ino=%" PRIu64 ", newparent=%" PRIu64 ", newname=%s)\n", ino, newparent, newname);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
 
@@ -5497,8 +5570,8 @@ ovl_symlink (fuse_req_t req, const char *link, fuse_ino_t parent, const char *na
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_symlink(link=%s, ino=%" PRIu64 ", name=%s)\n", link, parent, name);
   
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
 
@@ -5927,8 +6000,8 @@ ovl_rename (fuse_req_t req, fuse_ino_t parent, const char *name,
       return;
     }
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
 
@@ -5953,8 +6026,8 @@ ovl_statfs (fuse_req_t req, fuse_ino_t ino)
   struct statvfs sfs;
   struct ovl_data *lo = ovl_data (req);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
   ret = do_statfs (lo, &sfs);
@@ -5980,8 +6053,8 @@ ovl_readlink (fuse_req_t req, fuse_ino_t ino)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_readlink(ino=%" PRIu64 ")\n", ino);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
 
@@ -6080,8 +6153,8 @@ ovl_mknod (fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode, dev
     fprintf (stderr, "ovl_mknod(ino=%" PRIu64 ", name=%s, mode=%d, rdev=%lu)\n",
 	     parent, name, mode, rdev);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
 
@@ -6208,8 +6281,8 @@ ovl_mkdir (fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode)
     fprintf (stderr, "ovl_mkdir(ino=%" PRIu64 ", name=%s, mode=%d)\n",
 	     parent, name, mode);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
 
@@ -6386,8 +6459,8 @@ do_fsync (fuse_req_t req, fuse_ino_t ino, int datasync, int fd)
 static void
 ovl_fsync (fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *fi)
 {
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
 
@@ -6401,8 +6474,8 @@ ovl_fsync (fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *
 static void
 ovl_fsyncdir (fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *fi)
 {
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
 
@@ -6437,8 +6510,8 @@ ovl_ioctl (fuse_req_t req, fuse_ino_t ino, int cmd, void *arg,
       return;
     }
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
     }
 
@@ -6523,8 +6596,8 @@ ovl_fallocate (fuse_req_t req, fuse_ino_t ino, int mode, off_t offset, off_t len
       return;
     }
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (0 == checkAuthority(req)) {
+      fuse_reply_err (req, ENOENT);
       return;
     }
 
@@ -6873,9 +6946,20 @@ void newKey(const char *password, int passwdLength, int keySize, int ivLength) {
     HMAC_Init_ex(gSSLKey.mac_ctx, gSSLKey.buffer, keySize, EVP_sha1(), NULL);
 }
 
+bool init_ovl_pidinfo()
+{
+    gOvlPid = getpid();
+    gManagePid = getppid();
+
+    if (gOvlPid < 0 || gManagePid < 0)
+        return false;
+
+    return true;
+}
+
 int main (int argc, char *argv[])
 {
-  unsigned char password[] = "enlink";
+  unsigned char password[] = "darkforest";
   struct fuse_session *se;
   struct fuse_cmdline_opts opts;
   char **newargv = get_new_args (&argc, argv);
@@ -6937,6 +7021,11 @@ int main (int argc, char *argv[])
       fuse_lowlevel_version ();
       exit (EXIT_SUCCESS);
     }
+
+  if(!init_ovl_pidinfo())
+  {
+    error (EXIT_FAILURE, 0, "get fuse-overlayfs pid fail");
+  }
 
   lo.uid = geteuid ();
   lo.gid = getegid ();
