@@ -63,6 +63,7 @@
 
 #include <utils.h>
 #include <plugin.h>
+#include <syslog.h>
 
 #ifndef TEMP_FAILURE_RETRY
 #define TEMP_FAILURE_RETRY(expression) \
@@ -985,6 +986,39 @@ static int checkAuthority(int pid_guest) {
 }
 */
 
+static pid_t getParentPid(pid_t pid)
+{
+  char statPath[MAX_PATH_STR] = {0};
+  char buf[MAX_PATH_STR] = {0};
+  char procName[MAX_PATH_STR]={0};
+  int fpid=0;
+  struct stat st;
+  ssize_t ret =0;
+
+  if (pid < 0)
+      return INVALID_PID;
+
+  sprintf(statPath,"/proc/%d/stat",pid);
+
+  if(stat(statPath,&st)!=0)
+  {
+      return INVALID_PID; 
+  }
+
+  FILE * fp = fopen(statPath,"r");
+  ret += fread(buf + ret,1,300-ret,fp);
+  fclose(fp);
+
+  sscanf(buf,"%*d %*c%s %*c %d %*s",procName,&fpid);
+
+  if (strlen(procName) > 0) {
+      procName[strlen(procName)-1]='\0';
+  }
+  //syslog(LOG_INFO, "procName=%s\n", procName);
+
+  return fpid;
+}
+
 int isInBox(fuse_req_t req, pid_t pid)
 {
     char statPath[MAX_PATH_STR] = {0};
@@ -998,6 +1032,12 @@ int isInBox(fuse_req_t req, pid_t pid)
     {
         sprintf(statPath,"/proc/%d/stat",pid);
 
+        if(pid==gManagePid)
+        {
+            //syslog(LOG_INFO, "pid=%d, gManagePid=%d\n", pid, gManagePid);
+            return true;
+        }
+
         if(stat(statPath,&st)!=0)
         {
             return false;
@@ -1010,17 +1050,11 @@ int isInBox(fuse_req_t req, pid_t pid)
         sscanf(buf,"%*d %*c%s %*c %d %*s",procName,&fpid);
         procName[strlen(procName)-1]='\0';
 
-        if(fpid==gManagePid)
-        {
-            return true;
-        }
-        
-        /*
+        //allow firejail --join
         if(strncmp(procName, "firejail", strlen("firejail"))==0)
         {
             return true;
         }
-        */
         
         pid = fpid;
         memset(statPath,0,strlen(statPath));
@@ -1066,6 +1100,7 @@ int checkPath(struct ovl_data *lo, char *path)
 
     if (0 == strncmp(path, dname+1, strlen(dname+1))) {
         fprintf(stderr, "CheckPath deny, path=%s\n", path);
+        //syslog(LOG_INFO, "CheckPath deny, path=%s\n", path);
         return 0;
     }
     else
