@@ -1086,7 +1086,7 @@ int isInBox(fuse_req_t req, pid_t accessPid)
     return false;
 }
 
-static int checkAuthority(fuse_req_t req) 
+static int checkAuthority(fuse_req_t req, fuse_ino_t ino)
 {
     int fpid = 0;
     bool flag = false;
@@ -1096,6 +1096,11 @@ static int checkAuthority(fuse_req_t req)
         fprintf (stderr, "checkAuthority(pid=%d gManagePid=%d)\n", req->ctx.pid, gManagePid);
     }
 
+    if (ino == FUSE_ROOT_ID)
+    {
+        return true;
+    }
+
     flag = isInBox(req, req->ctx.pid);
     if(!flag)
     {
@@ -1103,7 +1108,8 @@ static int checkAuthority(fuse_req_t req)
         syslog(LOG_INFO, "checkAuthority deny!\n");
     }
     flag = true;
-    return flag?1:0;
+    //assert(flag == true);
+    return flag;
 }
 
 //防止死循环挂载
@@ -1159,7 +1165,6 @@ int checkAccess(fuse_req_t req, struct ovl_data *lo, char *nodePath) {
         guestpid[len] = '\0';
     }
 
-    //box����
     if (strcmp(guestpid, hostpid) == 0) {
         if(isBoxRunning)
         {
@@ -1205,7 +1210,6 @@ int checkAccess(fuse_req_t req, struct ovl_data *lo, char *nodePath) {
 
         */
     }
-    //box����
     else{
         return checkPath(lo, nodePath);
     }
@@ -1668,13 +1672,15 @@ ovl_forget (fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
   cleanup_lock int l = enter_big_lock ();
   struct ovl_data *lo = ovl_data (req);
 
-  if (0 == checkAuthority(req)) {
-      fuse_reply_err (req, ENOENT);
-      return;
-  }
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_forget(ino=%" PRIu64 ", nlookup=%lu)\n",
 	     ino, nlookup);
+
+  if (!checkAuthority(req, ino)) {
+      fuse_reply_err (req, ENOENT);
+      return;
+  }
+           
   do_forget (lo, ino, nlookup);
   fuse_reply_none (req);
 }
@@ -1689,11 +1695,6 @@ ovl_forget_multi (fuse_req_t req, size_t count, struct fuse_forget_data *forgets
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_forget_multi(count=%zu, forgets=%p)\n",
 	     count, forgets);
-
-  if (0 == checkAuthority(req)) {
-      fuse_reply_err (req, ENOENT);
-      return;
-  }
 
   for (i = 0; i < count; i++)
     do_forget (lo, forgets[i].ino, forgets[i].nlookup);
@@ -2557,10 +2558,11 @@ ovl_lookup (fuse_req_t req, fuse_ino_t parent, const char *name)
     fprintf (stderr, "ovl_lookup(parent=%" PRIu64 ", name=%s)\n",
 	     parent, name);
 
-  if (0 == checkAuthority(req)) {
+  if (!checkAuthority(req, parent)) {
       fuse_reply_err (req, ENOENT);
       return;
   }
+
   memset (&e, 0, sizeof (e));
 
   node = do_lookup_file (req, lo, parent, name);
@@ -2572,6 +2574,9 @@ ovl_lookup (fuse_req_t req, fuse_ino_t parent, const char *name)
       fuse_reply_entry (req, &e);
       return;
     }
+
+  if (UNLIKELY (ovl_debug (req)))
+    fprintf (stderr, "ovl_lookup(child=%" PRIu64 ")\n", node->ino->ino);
 
   if (!lo->static_nlink && node_dirp (node))
     {
@@ -2659,7 +2664,7 @@ ovl_opendir (fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_opendir(ino=%" PRIu64 ")\n", ino);
 
-  if (0 == checkAuthority(req)) {
+  if (!checkAuthority(req, ino)) {
       fuse_reply_err (req, ENOENT);
       return;
   }
@@ -2897,12 +2902,15 @@ ovl_readdir (fuse_req_t req, fuse_ino_t ino, size_t size,
 	    off_t offset, struct fuse_file_info *fi)
 {
   cleanup_lock int l = enter_big_lock ();
-  if (0 == checkAuthority(req)) {
+
+  if (UNLIKELY (ovl_debug (req)))
+    fprintf (stderr, "ovl_readdir(ino=%" PRIu64 ", size=%zu, offset=%lo)\n", ino, size, offset);
+
+  if (!checkAuthority(req, ino)) {
       fuse_reply_err (req, ENOENT);
       return;
   }
-  if (UNLIKELY (ovl_debug (req)))
-    fprintf (stderr, "ovl_readdir(ino=%" PRIu64 ", size=%zu, offset=%lo)\n", ino, size, offset);
+    
   ovl_do_readdir (req, ino, size, offset, fi, 0);
 }
 
@@ -2911,12 +2919,15 @@ ovl_readdirplus (fuse_req_t req, fuse_ino_t ino, size_t size,
 		off_t offset, struct fuse_file_info *fi)
 {
   cleanup_lock int l = enter_big_lock ();
-  if (0 == checkAuthority(req)) {
+
+  if (UNLIKELY (ovl_debug (req)))
+    fprintf (stderr, "ovl_readdirplus(ino=%" PRIu64 ", size=%zu, offset=%lo)\n", ino, size, offset);
+
+  if (!checkAuthority(req, ino)) {
       fuse_reply_err (req, ENOENT);
       return;
   }
-  if (UNLIKELY (ovl_debug (req)))
-    fprintf (stderr, "ovl_readdirplus(ino=%" PRIu64 ", size=%zu, offset=%lo)\n", ino, size, offset);
+
   ovl_do_readdir (req, ino, size, offset, fi, 1);
 }
 
@@ -2932,10 +2943,11 @@ ovl_releasedir (fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_releasedir(ino=%" PRIu64 ")\n", ino);
 
-  if (0 == checkAuthority(req)) {
+  if (!checkAuthority(req, ino)) {
       fuse_reply_err (req, ENOENT);
       return;
   }
+
   for (s = 2; s < d->tbl_size; s++)
     {
       d->tbl[s]->node_lookups--;
@@ -3003,7 +3015,7 @@ ovl_listxattr (fuse_req_t req, fuse_ino_t ino, size_t size)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_listxattr(ino=%" PRIu64 ", size=%zu)\n", ino, size);
 
-  if (0 == checkAuthority(req)) {
+  if (!checkAuthority(req, ino)) {
       fuse_reply_err (req, ENOENT);
       return;
   }
@@ -3066,7 +3078,7 @@ ovl_getxattr (fuse_req_t req, fuse_ino_t ino, const char *name, size_t size)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_getxattr(ino=%" PRIu64 ", name=%s, size=%zu)\n", ino, name, size);
 
-  if (0 == checkAuthority(req)) {
+  if (!checkAuthority(req, ino)) {
       fuse_reply_err (req, ENOENT);
       return;
   }
@@ -3134,10 +3146,11 @@ ovl_access (fuse_req_t req, fuse_ino_t ino, int mask)
     fprintf (stderr, "ovl_access(ino=%" PRIu64 ", mask=%d)\n",
 	     ino, mask);
 
-  if (0 == checkAuthority(req)) {
+  if (!checkAuthority(req, ino)) {
       fuse_reply_err (req, ENOENT);
       return;
   }
+
   if ((mask & n->ino->mode) == mask)
     fuse_reply_err (req, 0);
   else
@@ -3714,8 +3727,8 @@ ssize_t readOneBlock(fuse_req_t req, struct ovl_node *node, const struct IOReque
 
   if (UNLIKELY (ovl_debug (req)))
   {
-    fprintf (stderr, "readOneBlock raw(%d)", readSize, blockReq->data);
-    printhex((unsigned char*)blockReq->data, readSize);
+    fprintf (stderr, "readOneBlock raw(%d)", readSize);
+    //printhex((unsigned char*)blockReq->data, readSize);
     fprintf (stderr, "\n");
   }
 
@@ -3736,6 +3749,7 @@ ssize_t readOneBlock(fuse_req_t req, struct ovl_node *node, const struct IOReque
             break;
           }
         }
+        ok = true;
       }
       else
       {
@@ -3761,8 +3775,8 @@ ssize_t readOneBlock(fuse_req_t req, struct ovl_node *node, const struct IOReque
 
   if (UNLIKELY (ovl_debug (req)))
   {
-    fprintf (stderr, "readOneBlock decode ok=%d(%d)", ok, readSize, blockReq->data);
-    printhex((unsigned char*)blockReq->data, readSize);
+    fprintf (stderr, "readOneBlock decode ok=%d(%d)", ok, readSize);
+    //printhex((unsigned char*)blockReq->data, readSize);
     fprintf (stderr, "\n");
   }
 
@@ -3788,8 +3802,8 @@ ssize_t writeOneBlock(fuse_req_t req, struct ovl_node *node, const struct IORequ
     
     if (UNLIKELY (ovl_debug (req)))
     {
-        fprintf (stderr, "writeOneBlock ok=%d(%d):", ok, blockReq->dataLen);
-        printhex((unsigned char*)blockReq->data, blockReq->dataLen);
+        fprintf (stderr, "writeOneBlock encode ok=%d(%d):", ok, blockReq->dataLen);
+        //printhex((unsigned char*)blockReq->data, blockReq->dataLen);
         fprintf (stderr, "\n");
     }
 
@@ -4201,6 +4215,7 @@ ssize_t fileEncode(fuse_req_t req, struct ovl_node *node, int sfd, int dfd, off_
     BUF_MEM *data = NULL;
     size_t blockIndex = 0;
     ssize_t res = 0;
+    ssize_t total = 0;
     struct IORequest tmp;
 
     if (fileSize <= 0) {
@@ -4246,11 +4261,15 @@ ssize_t fileEncode(fuse_req_t req, struct ovl_node *node, int sfd, int dfd, off_
             }
             readSize = -eno;
         }
+        assert(readSize==tmp.dataLen);
         res = writeOneBlock(req, node, &tmp);
         if (res < 0) {
             break;
         }
+        total += tmp.dataLen;
     }
+
+    assert(total==fileSize);
 
     if (data != NULL) {
         BUF_MEM_free(data);
@@ -4260,7 +4279,7 @@ ssize_t fileEncode(fuse_req_t req, struct ovl_node *node, int sfd, int dfd, off_
         return res;
     }
     
-    return fileSize;
+    return total;
 }
 
 static int
@@ -4280,6 +4299,9 @@ copyup (fuse_req_t req, struct ovl_data *lo, struct ovl_node *node)
   bool data_copied = false;
   mode_t mode;
   struct ovl_layer *l;
+
+  if (UNLIKELY (ovl_debug (req)))
+    fprintf (stderr, "copyup(ino=%" PRIu64 ", name=%s)\n", node->ino->ino, node->path);
 
   sprintf (wd_tmp_file_name, "%lu", get_next_wd_counter ());
 
@@ -4411,15 +4433,13 @@ copyup (fuse_req_t req, struct ovl_data *lo, struct ovl_node *node)
     goto exit;
 
   /* Finally, move the file to its destination.  */
-  /*
-  ret = renameat (lo->workdir_fd, wd_tmp_file_name, get_upper_layer (lo)->fd, node->path);
-  if (ret < 0)
-    goto exit;
-  */
-
   l = get_upper_layer (lo);
   ufd = l->ds->openat (l, node->path, O_CREAT|O_WRONLY, mode);
-  ret = fileEncode(req, node, dfd, ufd, st.st_size);
+  ret = fileEncode(req, node, dfd, dfd, st.st_size);
+  if (ret < 0)
+    goto exit;
+
+  ret = renameat (lo->workdir_fd, wd_tmp_file_name, get_upper_layer (lo)->fd, node->path);
   if (ret < 0)
     goto exit;
 
@@ -4648,14 +4668,16 @@ static void
 ovl_unlink (fuse_req_t req, fuse_ino_t parent, const char *name)
 {
   cleanup_lock int l = enter_big_lock ();
-  if (0 == checkAuthority(req)) {
-      fuse_reply_err (req, ENOENT);
-      return;
-  }
 
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_unlink(parent=%" PRIu64 ", name=%s)\n",
 	     parent, name);
+  
+  if (!checkAuthority(req, parent)) {
+    fuse_reply_err (req, ENOENT);
+    return;
+  }
+
   do_rm (req, parent, name, false);
 }
 
@@ -4663,14 +4685,16 @@ static void
 ovl_rmdir (fuse_req_t req, fuse_ino_t parent, const char *name)
 {
   cleanup_lock int l = enter_big_lock ();
-  if (0 == checkAuthority(req)) {
-      fuse_reply_err (req, ENOENT);
-      return;
-  }
 
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_rmdir(parent=%" PRIu64 ", name=%s)\n",
 	     parent, name);
+
+  if (!checkAuthority(req, parent)) {
+    fuse_reply_err (req, ENOENT);
+    return;
+  }
+
   do_rm (req, parent, name, true);
 }
 
@@ -4705,7 +4729,7 @@ ovl_setxattr (fuse_req_t req, fuse_ino_t ino, const char *name,
     fprintf (stderr, "ovl_setxattr(ino=%" PRIu64 ", name=%s, value=%s, size=%zu, flags=%d)\n", ino, name,
              value, size, flags);
 
-  if (0 == checkAuthority(req)) {
+  if (!checkAuthority(req, ino)) {
       fuse_reply_err (req, ENOENT);
       return;
   }
@@ -4782,7 +4806,7 @@ ovl_removexattr (fuse_req_t req, fuse_ino_t ino, const char *name)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_removexattr(ino=%" PRIu64 ", name=%s)\n", ino, name);
 
-  if (0 == checkAuthority(req)) {
+  if (!checkAuthority(req, ino)) {
       fuse_reply_err (req, ENOENT);
       return;
   }
@@ -5021,14 +5045,17 @@ static void ovl_read (fuse_req_t req, fuse_ino_t ino, size_t size,
     struct IORequest blockReq;
     struct ovl_node *node;
     struct ovl_data *lo = ovl_data (req);
-    
-    if (UNLIKELY (ovl_debug (req)))
-    fprintf (stderr, "ovl_read(ino=%" PRIu64 ", size=%zd, off=%lu)\n", ino, size, (unsigned long) offset);
 
     node = inode_to_node (lo, ino);
+    if (UNLIKELY (ovl_debug (req)))
+        fprintf (stderr, "ovl_read(ino=%" PRIu64 ", path=%s, size=%zd, off=%lu)\n", ino, node->path, size, (unsigned long) offset);
+
+    if (!checkAuthority(req, ino)) {
+        fuse_reply_err (req, ENOENT);
+        return;
+    }
 
     fprintf (stderr, "path=%s name=%s layer=%p last_layer=%p lower=%p upper=%p\n", node->path, node->name, node->layer, node->last_layer, get_lower_layers (lo), get_upper_layer (lo));
-
     if (node->layer == get_upper_layer (lo) || node->last_layer == get_upper_layer (lo))
     {
         buffer = (char *)malloc(size);
@@ -5087,37 +5114,41 @@ static void ovl_write_buf (fuse_req_t req, fuse_ino_t ino,
     out_buf.buf[0].fd = fi->fh;
     out_buf.buf[0].pos = off;
 
-    if (UNLIKELY (ovl_debug (req)))
+    node = inode_to_node (lo, ino);
+    if (node == NULL || node->whiteout)
     {
-        fprintf (stderr, "ovl_write_buf(ino=%" PRIu64 ", size=%zd, off=%lu, fd=%d)\n",
-            ino, out_buf.buf[0].size, (unsigned long) off, (int) fi->fh);
+        fuse_reply_err (req, ENOENT);
+        return;
     }
 
-    node = inode_to_node (lo, ino);
+    if (UNLIKELY (ovl_debug (req)))
+    {
+        fprintf (stderr, "ovl_write_buf(ino=%" PRIu64 ", size=%zd, off=%lu, fd=%d, path=%s)\n",
+            ino, out_buf.buf[0].size, (unsigned long) off, (int) fi->fh, node->path);
+    }
+
+    if (!checkAuthority(req, ino)) {
+        fuse_reply_err (req, ENOENT);
+        return;
+    }
+
+    fprintf (stderr, "path=%s name=%s layer=%p last_layer=%p lower=%p upper=%p\n", node->path, node->name, node->layer, node->last_layer, get_lower_layers (lo), get_upper_layer (lo));
     if (node->layer == get_upper_layer (lo) || node->last_layer == get_upper_layer (lo))
     {
-
         buf = &in_buf->buf[0];
         if (UNLIKELY (ovl_debug (req)))
         {
             fprintf (stderr, "ovl_write_buf(%d, %d, %d):", buf->size, in_buf->off, buf->pos);
-            printhex((unsigned char*)buf->mem, buf->size);
+            //printhex((unsigned char*)buf->mem, buf->size);
             fprintf (stderr, "\n");
         }
 
-        blockReq.fd = fi->fh;
+        blockReq.fd = node->layer->ds->openat (node->layer, node->path, O_RDWR, node->ino->mode);
         blockReq.offset = off;
         blockReq.dataLen = buf->size;
         blockReq.data = (unsigned char *)buf->mem;
-        
-        node = inode_to_node (lo, ino);
-        if (node == NULL || node->whiteout)
-        {
-            fuse_reply_err (req, ENOENT);
-            return;
-        }
 
-        //pthread_mutex_lock (&lock);
+        pthread_mutex_lock (&lock);
         ret = rpl_stat (req, node, -1, NULL, NULL, &s);
         if (ret)
         {
@@ -5127,7 +5158,7 @@ static void ovl_write_buf (fuse_req_t req, fuse_ino_t ino,
 
         res = writeBlocks(req, node, s.st_size, &blockReq);
         saved_errno = errno;
-        //pthread_mutex_unlock (&lock);
+        pthread_mutex_unlock (&lock);
     }
     else
     {
@@ -5148,7 +5179,10 @@ static void ovl_write_buf (fuse_req_t req, fuse_ino_t ino,
     }
 
     if (res < 0)
+    {
+        fprintf (stderr, "ovl_write_buf(res=%d, saved_errno=%d)", res, saved_errno);
         fuse_reply_err (req, saved_errno);
+    }
     else
         fuse_reply_write (req, (size_t) res);
 }
@@ -5161,6 +5195,11 @@ ovl_release (fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_release(ino=%" PRIu64 ")\n", ino);
+
+  if (!checkAuthority(req, ino)) {
+      fuse_reply_err (req, ENOENT);
+      return;
+  }
 
   ret = close (fi->fh);
   fuse_reply_err (req, ret == 0 ? 0 : errno);
@@ -5237,15 +5276,17 @@ ovl_create (fuse_req_t req, fuse_ino_t parent, const char *name,
     fprintf (stderr, "ovl_create(parent=%" PRIu64 ", name=%s)\n",
 	     parent, name);
 
+  if (!checkAuthority(req, parent)) {
+      fuse_reply_err (req, ENOENT);
+      return;
+  }
+
   if (strlen (name) > get_fs_namemax (lo))
     {
       fuse_reply_err (req, ENAMETOOLONG);
       return;
     }
-  if (0 == checkAuthority(req)) {
-      fuse_reply_err (req, ENOENT);
-      return;
-  }
+
   fi->flags = fi->flags | O_CREAT;
 
   if (lo->xattr_permissions)
@@ -5283,21 +5324,24 @@ ovl_open (fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
   cleanup_lock int l = enter_big_lock ();
   cleanup_close int fd = -1;
   int flags = 0;
+  struct ovl_node *node;
 
   if(fi->flags&O_WRONLY)
   {
     //readOneBlock need the O_RDWR to pread
     flags = fi->flags&(~O_WRONLY)&(~O_APPEND)|O_RDWR;
   }
-  
+
+  node = inode_to_node (lo, ino);
   if (UNLIKELY (ovl_debug (req)))
-    fprintf (stderr, "ovl_open(ino=%" PRIu64 ", flags=%d)\n", ino, flags);
-  if (0 == checkAuthority(req)) {
+    fprintf (stderr, "ovl_open(ino=%" PRIu64 ", path=%s, flags=%d)\n", ino, node->path, fi->flags);
+
+  if (!checkAuthority(req, ino)) {
       fuse_reply_err (req, ENOENT);
       return;
   }
-  
-  fd = ovl_do_open (req, ino, NULL, flags, 0700, NULL, NULL);
+
+  fd = ovl_do_open (req, ino, NULL, fi->flags, 0700, NULL, NULL);
   if (fd < 0)
     {
       fuse_reply_err (req, errno);
@@ -5325,7 +5369,7 @@ ovl_getattr (fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
   }
   syslog(LOG_INFO, "ovl_getattr(ino=%" PRIu64 ", path=%s)\n", ino, node->path);
 
-  if (0 == checkAuthority(req)) {
+  if (!checkAuthority(req, ino)) {
       fuse_reply_err (req, ENOENT);
       return;
   }
@@ -5362,11 +5406,12 @@ ovl_setattr (fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to_set, stru
 
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_setattr(ino=%" PRIu64 ", to_set=%d)\n", ino, to_set);
-  
-  if (0 == checkAuthority(req)) {
-      fuse_reply_err (req, ENOENT);
-      return;
+
+  if (!checkAuthority(req, ino)) {
+    fuse_reply_err (req, ENOENT);
+    return;
   }
+
   node = do_lookup_file (req, lo, ino, NULL);
   if (node == NULL || node->whiteout)
     {
@@ -5553,9 +5598,9 @@ ovl_link (fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent, const char *newn
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_link(ino=%" PRIu64 ", newparent=%" PRIu64 ", newname=%s)\n", ino, newparent, newname);
 
-  if (0 == checkAuthority(req)) {
-      fuse_reply_err (req, ENOENT);
-      return;
+  if (!checkAuthority(req, ino)) {
+    fuse_reply_err (req, ENOENT);
+    return;
   }
 
   if (strlen (newname) > get_fs_namemax (lo))
@@ -5702,10 +5747,10 @@ ovl_symlink (fuse_req_t req, const char *link, fuse_ino_t parent, const char *na
 
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_symlink(link=%s, ino=%" PRIu64 ", name=%s)\n", link, parent, name);
-  
-  if (0 == checkAuthority(req)) {
-      fuse_reply_err (req, ENOENT);
-      return;
+
+  if (!checkAuthority(req, parent)) {
+    fuse_reply_err (req, ENOENT);
+    return;
   }
 
   if (strlen (name) > get_fs_namemax (lo))
@@ -6127,16 +6172,16 @@ ovl_rename (fuse_req_t req, fuse_ino_t parent, const char *name,
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_rename(ino=%" PRIu64 ", name=%s , ino=%" PRIu64 ", name=%s)\n", parent, name, newparent, newname);
 
+  if (!checkAuthority(req, parent)) {
+    fuse_reply_err (req, ENOENT);
+    return;
+  }
+
   if (strlen (newname) > get_fs_namemax (lo))
     {
       fuse_reply_err (req, ENAMETOOLONG);
       return;
     }
-
-  if (0 == checkAuthority(req)) {
-      fuse_reply_err (req, ENOENT);
-      return;
-  }
 
   if (flags & RENAME_EXCHANGE)
     ovl_rename_exchange (req, parent, name, newparent, newname, flags);
@@ -6159,10 +6204,11 @@ ovl_statfs (fuse_req_t req, fuse_ino_t ino)
   struct statvfs sfs;
   struct ovl_data *lo = ovl_data (req);
 
-  if (0 == checkAuthority(req)) {
+  if (!checkAuthority(req, ino)) {
       fuse_reply_err (req, ENOENT);
       return;
   }
+
   ret = do_statfs (lo, &sfs);
   if (ret < 0)
     {
@@ -6186,7 +6232,7 @@ ovl_readlink (fuse_req_t req, fuse_ino_t ino)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_readlink(ino=%" PRIu64 ")\n", ino);
 
-  if (0 == checkAuthority(req)) {
+  if (!checkAuthority(req, ino)) {
       fuse_reply_err (req, ENOENT);
       return;
   }
@@ -6286,9 +6332,9 @@ ovl_mknod (fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode, dev
     fprintf (stderr, "ovl_mknod(ino=%" PRIu64 ", name=%s, mode=%d, rdev=%lu)\n",
 	     parent, name, mode, rdev);
 
-  if (0 == checkAuthority(req)) {
-      fuse_reply_err (req, ENOENT);
-      return;
+  if (!checkAuthority(req, parent)) {
+    fuse_reply_err (req, ENOENT);
+    return;
   }
 
   if (strlen (name) > get_fs_namemax (lo))
@@ -6414,9 +6460,9 @@ ovl_mkdir (fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode)
     fprintf (stderr, "ovl_mkdir(ino=%" PRIu64 ", name=%s, mode=%d)\n",
 	     parent, name, mode);
 
-  if (0 == checkAuthority(req)) {
-      fuse_reply_err (req, ENOENT);
-      return;
+  if (!checkAuthority(req, parent)) {
+    fuse_reply_err (req, ENOENT);
+    return;
   }
 
   if (strlen (name) > get_fs_namemax (lo))
@@ -6592,14 +6638,14 @@ do_fsync (fuse_req_t req, fuse_ino_t ino, int datasync, int fd)
 static void
 ovl_fsync (fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *fi)
 {
-  if (0 == checkAuthority(req)) {
-      fuse_reply_err (req, ENOENT);
-      return;
-  }
-
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_fsync(ino=%" PRIu64 ", datasync=%d, fi=%p)\n",
              ino, datasync, fi);
+
+  if (!checkAuthority(req, ino)) {
+    fuse_reply_err (req, ENOENT);
+    return;
+  }
 
   return do_fsync (req, ino, datasync, fi->fh);
 }
@@ -6607,14 +6653,14 @@ ovl_fsync (fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *
 static void
 ovl_fsyncdir (fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *fi)
 {
-  if (0 == checkAuthority(req)) {
-      fuse_reply_err (req, ENOENT);
-      return;
-  }
-
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_fsyncdir(ino=%" PRIu64 ", datasync=%d, fi=%p)\n",
              ino, datasync, fi);
+
+  if (!checkAuthority(req, ino)) {
+    fuse_reply_err (req, ENOENT);
+    return;
+  }
 
   return do_fsync (req, ino, datasync, -1);
 }
@@ -6643,14 +6689,14 @@ ovl_ioctl (fuse_req_t req, fuse_ino_t ino, int cmd, void *arg,
       return;
     }
 
-  if (0 == checkAuthority(req)) {
-      fuse_reply_err (req, ENOENT);
-      return;
-    }
-
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_ioctl(ino=%" PRIu64 ", cmd=%d, arg=%p, fi=%p, flags=%d, buf=%p, in_bufsz=%zu, out_bufsz=%zu)\n",
              ino, cmd, arg, fi, flags, in_buf, in_bufsz, out_bufsz);
+
+  if (!checkAuthority(req, ino)) {
+    fuse_reply_err (req, ENOENT);
+    return;
+  }
 
   node = do_lookup_file (req, lo, ino, NULL);
   if (node == NULL || node->whiteout)
@@ -6722,14 +6768,14 @@ ovl_fallocate (fuse_req_t req, fuse_ino_t ino, int mode, off_t offset, off_t len
     fprintf (stderr, "ovl_fallocate(ino=%" PRIu64 ", mode=%d, offset=%lo, length=%lu, fi=%p)\n",
              ino, mode, offset, length, fi);
 
+  if (!checkAuthority(req, ino)) {
+    fuse_reply_err (req, ENOENT);
+    return;
+  }
+
   node = do_lookup_file (req, lo, ino, NULL);
   if (node == NULL || node->whiteout)
     {
-      fuse_reply_err (req, ENOENT);
-      return;
-    }
-
-  if (0 == checkAuthority(req)) {
       fuse_reply_err (req, ENOENT);
       return;
     }
@@ -6778,6 +6824,11 @@ ovl_copy_file_range (fuse_req_t req, fuse_ino_t ino_in, off_t off_in, struct fus
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_copy_file_range(ino_in=%" PRIu64 ", off_in=%lo, fi_in=%p, ino_out=%" PRIu64 ", off_out=%lo, fi_out=%p, size=%zu, flags=%d)\n",
              ino_in, off_in, fi_in, ino_out, off_out, fi_out, len, flags);
+
+  if (!checkAuthority(req, ino_in)) {
+    fuse_reply_err (req, ENOENT);
+    return;
+  }
 
   node = do_lookup_file (req, lo, ino_in, NULL);
   if (node == NULL || node->whiteout)
