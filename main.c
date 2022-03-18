@@ -1107,8 +1107,7 @@ static int checkAuthority(fuse_req_t req, fuse_ino_t ino)
         fprintf (stderr, "checkAuthority deny!\n");
         syslog(LOG_INFO, "checkAuthority deny!\n");
     }
-    flag = true;
-    //assert(flag == true);
+    //flag = true;
     return flag;
 }
 
@@ -1358,6 +1357,7 @@ node_free (void *p)
   stats.nodes--;
   free (n->name);
   free (n->path);
+  free (n->cache.data);
 
   EVP_CIPHER_CTX_free(n->block_enc);
   EVP_CIPHER_CTX_free(n->block_dec);
@@ -3417,37 +3417,6 @@ create_node_directory (struct ovl_data *lo, struct ovl_node *src)
   return ret;
 }
 
-static int
-copy_fd_to_fd (int sfd, int dfd, char *buf, size_t buf_size)
-{
-  int ret;
-
-  for (;;)
-    {
-      int written;
-      int nread;
-
-      nread = TEMP_FAILURE_RETRY (read (sfd, buf, buf_size));
-      if (nread < 0)
-        return nread;
-
-      if (nread == 0)
-        break;
-
-      written = 0;
-      do
-        {
-          ret = TEMP_FAILURE_RETRY (write (dfd, buf + written, nread));
-          if (ret < 0)
-            return ret;
-          nread -= ret;
-          written += ret;
-        }
-      while (nread);
-    }
-  return 0;
-}
-
 #define min(x, y) ((x) < (y) ? (x) : (y))
 
 static int reply_buf_limited(fuse_req_t req, const char *buf, size_t bufsize,
@@ -3673,34 +3642,18 @@ bool blockDecode(fuse_req_t req, struct ovl_node *node, unsigned char *buf, int 
 
 void printhex(unsigned char *src,int len)
 {
+    int i=0;
+
     if(src==NULL)
     {
         return;
     }
-    if(len>(1024*1024*3-1))
-    {      
-        return;
-    }
-    char x[1024*1024*3]={0};
-    int i=0;
+
     for(i=0;i<len;i++)
     {
-        /*
-        char tmp[10]={0};
-        if(isprint(src[i]))
-        {
-          snprintf(tmp,8,"%c",src[i]);
-          strcat(x,tmp);
-        }
-        else
-        {
-          snprintf(tmp,8,"%X",src[i]);
-          strcat(x,tmp);
-        }
-        */
         fprintf (stderr, "%02X", src[i]);
     }
-    //fprintf (stderr, "%s", x);
+
     return;
 }
 
@@ -3899,7 +3852,7 @@ ssize_t cacheReadOneBlock(fuse_req_t req, struct ovl_node *node, const struct IO
     memcpy(blockReq->data, node->cache.data, result);
     if (UNLIKELY (ovl_debug (req)))
     {
-      fprintf(stderr, "cacheReadOneBlock save cache: offset=%d, dataLen=%d\n", blockReq->offset, blockReq->dataLen);
+      fprintf(stderr, "cacheReadOneBlock save cache: offset=%d, dataLen=%d data=%s\n", blockReq->offset, blockReq->dataLen, blockReq->data);
     }
   }
   return result;
@@ -4282,6 +4235,71 @@ ssize_t fileEncode(fuse_req_t req, struct ovl_node *node, int sfd, int dfd, off_
     return total;
 }
 
+static int encode_fd_to_fd (fuse_req_t req, struct ovl_node *node, int sfd, int dfd, char *buf, size_t buf_size, off_t fileSize)
+{
+    int ret;
+    int nread = 0;
+    int written = 0;
+    ssize_t total = 0;
+    struct IORequest tmp;
+
+    tmp.fd = dfd;
+    tmp.data = (unsigned char *)buf;
+    tmp.offset = 0;
+    for (;;)
+    {
+        memset(buf, 0, buf_size);
+        nread = TEMP_FAILURE_RETRY (read (sfd, buf, gBlockSize));
+        if (nread < 0)
+            return nread;
+
+        if (nread == 0)
+            break;
+
+        tmp.dataLen = nread;
+        written = writeOneBlock(req, node, &tmp);
+        if (written < 0) {
+            break;
+        }
+        assert(written==nread);
+        total += written;
+        tmp.offset += nread;
+    }
+
+    assert(total==fileSize);
+    return 0;
+}
+
+static int copy_fd_to_fd (int sfd, int dfd, char *buf, size_t buf_size)
+{
+  int ret;
+
+  for (;;)
+    {
+      int written;
+      int nread;
+
+      nread = TEMP_FAILURE_RETRY (read (sfd, buf, buf_size));
+      if (nread < 0)
+        return nread;
+
+      if (nread == 0)
+        break;
+
+      written = 0;
+      do
+        {
+          ret = TEMP_FAILURE_RETRY (write (dfd, buf + written, nread));
+          if (ret < 0)
+            return ret;
+          nread -= ret;
+          written += ret;
+        }
+      while (nread);
+    }
+  return 0;
+}
+
 static int
 copyup (fuse_req_t req, struct ovl_data *lo, struct ovl_node *node)
 {
@@ -4295,8 +4313,8 @@ copyup (fuse_req_t req, struct ovl_data *lo, struct ovl_node *node)
   cleanup_free char *buf = NULL;
   struct timespec times[2];
   char wd_tmp_file_name[32];
-  static bool support_reflinks = true;
-  bool data_copied = false;
+  //static bool support_reflinks = true;
+  //bool data_copied = false;
   mode_t mode;
   struct ovl_layer *l;
 
@@ -4377,13 +4395,14 @@ copyup (fuse_req_t req, struct ovl_data *lo, struct ovl_node *node)
   if (buf == NULL)
     goto exit;
 
+  /*
   if (support_reflinks)
     {
       if (ioctl (dfd, FICLONE, sfd) >= 0)
         data_copied = true;
       else if (errno == ENOTSUP || errno == EINVAL)
         {
-          /* Fallback to data copy and don't attempt again FICLONE.  */
+          // Fallback to data copy and don't attempt again FICLONE.
           support_reflinks = false;
         }
     }
@@ -4399,7 +4418,7 @@ copyup (fuse_req_t req, struct ovl_data *lo, struct ovl_node *node)
           ssize_t n = TEMP_FAILURE_RETRY (sendfile (dfd, sfd, NULL, tocopy > SIZE_MAX ? SIZE_MAX : (size_t) tocopy));
           if (n < 0)
             {
-              /* On failure, fallback to the read/write loop.  */
+              // On failure, fallback to the read/write loop.
               ret = copy_fd_to_fd (sfd, dfd, buf, buf_size);
               if (ret < 0)
                 goto exit;
@@ -4417,6 +4436,10 @@ copyup (fuse_req_t req, struct ovl_data *lo, struct ovl_node *node)
       if (ret < 0)
         goto exit;
     }
+  */
+  ret = encode_fd_to_fd (req, node, sfd, dfd, buf, buf_size, st.st_size);
+  if (ret < 0)
+    goto exit;
 
   times[0] = st.st_atim;
   times[1] = st.st_mtim;
@@ -4433,11 +4456,13 @@ copyup (fuse_req_t req, struct ovl_data *lo, struct ovl_node *node)
     goto exit;
 
   /* Finally, move the file to its destination.  */
+  /*
   l = get_upper_layer (lo);
   ufd = l->ds->openat (l, node->path, O_CREAT|O_WRONLY, mode);
   ret = fileEncode(req, node, dfd, dfd, st.st_size);
   if (ret < 0)
     goto exit;
+  */
 
   ret = renameat (lo->workdir_fd, wd_tmp_file_name, get_upper_layer (lo)->fd, node->path);
   if (ret < 0)
@@ -5055,7 +5080,7 @@ static void ovl_read (fuse_req_t req, fuse_ino_t ino, size_t size,
         return;
     }
 
-    fprintf (stderr, "path=%s name=%s layer=%p last_layer=%p lower=%p upper=%p\n", node->path, node->name, node->layer, node->last_layer, get_lower_layers (lo), get_upper_layer (lo));
+    //fprintf (stderr, "path=%s name=%s layer=%p last_layer=%p lower=%p upper=%p\n", node->path, node->name, node->layer, node->last_layer, get_lower_layers (lo), get_upper_layer (lo));
     if (node->layer == get_upper_layer (lo) || node->last_layer == get_upper_layer (lo))
     {
         buffer = (char *)malloc(size);
@@ -5099,7 +5124,6 @@ static void ovl_write_buf (fuse_req_t req, fuse_ino_t ino,
     size_t total = 0;
     struct ovl_data *lo = ovl_data (req);
     ssize_t res;
-    size_t i;
     struct ovl_node *node;
     struct ovl_ino *inode;
     int saved_errno;
@@ -5132,21 +5156,35 @@ static void ovl_write_buf (fuse_req_t req, fuse_ino_t ino,
         return;
     }
 
-    fprintf (stderr, "path=%s name=%s layer=%p last_layer=%p lower=%p upper=%p\n", node->path, node->name, node->layer, node->last_layer, get_lower_layers (lo), get_upper_layer (lo));
+    //fprintf (stderr, "path=%s name=%s layer=%p last_layer=%p lower=%p upper=%p\n", node->path, node->name, node->layer, node->last_layer, get_lower_layers (lo), get_upper_layer (lo));
     if (node->layer == get_upper_layer (lo) || node->last_layer == get_upper_layer (lo))
     {
         buf = &in_buf->buf[0];
+        blockReq.fd = node->layer->ds->openat (node->layer, node->path, O_RDWR, node->ino->mode);
+        blockReq.offset = off;
+        blockReq.dataLen = buf->size;
+
+        if(buf->flags & FUSE_BUF_IS_FD)
+        {
+            res = read(buf->fd, buf->mem+in_buf->off, buf->size);
+            if (res < 0) {
+                saved_errno = errno;
+                if (UNLIKELY (ovl_debug (req)))
+                {
+                    fprintf (stderr, "read failed at fd %d offset %d for %d bytes: %s\n", buf->fd, in_buf->off, buf->size, strerror(saved_errno));
+                }
+                fuse_reply_err (req, saved_errno);
+                return;
+            }
+        }
+        blockReq.data = (unsigned char *)buf->mem;
+
         if (UNLIKELY (ovl_debug (req)))
         {
             fprintf (stderr, "ovl_write_buf(%d, %d, %d):", buf->size, in_buf->off, buf->pos);
             //printhex((unsigned char*)buf->mem, buf->size);
             fprintf (stderr, "\n");
         }
-
-        blockReq.fd = node->layer->ds->openat (node->layer, node->path, O_RDWR, node->ino->mode);
-        blockReq.offset = off;
-        blockReq.dataLen = buf->size;
-        blockReq.data = (unsigned char *)buf->mem;
 
         pthread_mutex_lock (&lock);
         ret = rpl_stat (req, node, -1, NULL, NULL, &s);
@@ -5159,6 +5197,8 @@ static void ovl_write_buf (fuse_req_t req, fuse_ino_t ino,
         res = writeBlocks(req, node, s.st_size, &blockReq);
         saved_errno = errno;
         pthread_mutex_unlock (&lock);
+        
+        close(blockReq.fd);
     }
     else
     {
@@ -5178,6 +5218,7 @@ static void ovl_write_buf (fuse_req_t req, fuse_ino_t ino,
         }
     }
 
+    fprintf (stderr, "ovl_write_buf(res=%d)", res);
     if (res < 0)
     {
         fprintf (stderr, "ovl_write_buf(res=%d, saved_errno=%d)", res, saved_errno);
