@@ -65,6 +65,32 @@
 #include <plugin.h>
 #include <syslog.h>
 
+  // OpenSSL < 1.1.0 or LibreSSL
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
+  
+  // Equivalent methods
+#define EVP_MD_CTX_new EVP_MD_CTX_create
+#define EVP_MD_CTX_free EVP_MD_CTX_destroy
+#define HMAC_CTX_reset HMAC_CTX_cleanup
+  
+  // Missing methods (based on 1.1.0 versions)
+  HMAC_CTX *HMAC_CTX_new(void) {
+    HMAC_CTX *ctx = (HMAC_CTX *)OPENSSL_malloc(sizeof(HMAC_CTX));
+    if (ctx != NULL) {
+      memset(ctx, 0, sizeof(HMAC_CTX));
+      HMAC_CTX_reset(ctx);
+    }
+    return ctx;
+  }
+  
+  void HMAC_CTX_free(HMAC_CTX *ctx) {
+    if (ctx != NULL) {
+      HMAC_CTX_cleanup(ctx);
+      OPENSSL_free(ctx);
+    }
+  }
+#endif
+
 #ifndef TEMP_FAILURE_RETRY
 #define TEMP_FAILURE_RETRY(expression) \
   (__extension__                                                              \
@@ -4210,7 +4236,7 @@ ssize_t fileEncode(fuse_req_t req, struct ovl_node *node, int sfd, int dfd, off_
             int eno = errno;
             if (UNLIKELY (ovl_debug (req)))
             {
-                fprintf (stderr, "read failed at fd %ld offset %d for %ld bytes: %s\n", sfd, tmp.offset, tmp.dataLen, strerror(eno));
+                fprintf (stderr, "read failed at fd %d offset %ld for %ld bytes: %s\n", sfd, tmp.offset, tmp.dataLen, strerror(eno));
             }
             readSize = -eno;
         }
@@ -7160,11 +7186,8 @@ void newKey(const char *password, int passwdLength, int keySize, int ivLength) {
     EVP_CIPHER_CTX_init(gSSLKey.stream_dec);
     %*/
     
-    gSSLKey.mac_ctx = (HMAC_CTX *)OPENSSL_malloc(sizeof(HMAC_CTX));
-    if (gSSLKey.mac_ctx != NULL) {
-        memset(gSSLKey.mac_ctx, 0, sizeof(HMAC_CTX));
-        HMAC_CTX_cleanup(gSSLKey.mac_ctx);
-    }
+    gSSLKey.mac_ctx = HMAC_CTX_new();
+    HMAC_CTX_reset(gSSLKey.mac_ctx);
 
     EVP_BytesToKey(gSSLCipher.blockCipher, EVP_sha1(), NULL, password, passwdLength, 16, gSSLKey.buffer, gSSLKey.buffer+gSSLKey.keySize);
 
@@ -7457,10 +7480,7 @@ err_out1:
   fuse_opt_free_args (&args);
 
   OPENSSL_free(gSSLKey.buffer);
-  if (gSSLKey.mac_ctx != NULL) {
-    HMAC_CTX_cleanup(gSSLKey.mac_ctx);
-    OPENSSL_free(gSSLKey.mac_ctx);
-  }
+  HMAC_CTX_free(gSSLKey.mac_ctx);
 
   exit (ret ? EXIT_FAILURE : EXIT_SUCCESS);
   return 1;
