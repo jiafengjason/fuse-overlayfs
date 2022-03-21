@@ -63,6 +63,7 @@
 
 #include <utils.h>
 #include <plugin.h>
+#include <syslog.h>
 
 #ifndef TEMP_FAILURE_RETRY
 #define TEMP_FAILURE_RETRY(expression) \
@@ -99,6 +100,21 @@ static bool disable_locking;
 static pthread_mutex_t lock;
 char hostpid[64];
 bool isBoxRunning=false;
+
+struct SSLCipher gSSLCipher;
+struct SSLKey gSSLKey;
+
+unsigned int gBlockSize = 1024;
+unsigned int gKeyLen = 256;
+bool gAllowHoles = true;
+
+const int MAX_IVLENGTH = 16;   // 128 bit (AES block size, Blowfish has 64)
+
+static pid_t gOvlPid = 0;
+static pid_t gManagePid = 0;
+
+#define MAX_PATH_STR  1024
+#define INVALID_PID -1
 
 static int
 enter_big_lock ()
@@ -166,6 +182,14 @@ open_by_handle_at (int mount_fd, struct file_handle *handle, int flags)
 #define PRIVILEGED_ORIGIN_XATTR "trusted.overlay.origin"
 #define OPAQUE_WHITEOUT ".wh..wh..opq"
 #define WHITEOUT_MAX_LEN (sizeof (".wh.")-1)
+#define CHECK(x)                                            \
+    do {                                                    \
+        if (!(x)) {                                         \
+            fprintf(stderr, "%s:%d: ", __func__, __LINE__); \
+            perror(#x);                                     \
+            exit(-1);                                       \
+        }                                                   \
+    } while (0)
 
 #if !defined FICLONE && defined __linux__
 # define FICLONE _IOW (0x94, 9, int)
@@ -863,6 +887,7 @@ delete_whiteout (struct ovl_data *lo, int dirfd, struct ovl_node *parent, const 
   return 0;
 }
 
+/*
 int getParentPid(int pid, int *decision)
 {
     char dir[1024]={0};
@@ -902,7 +927,7 @@ int getParentPid(int pid, int *decision)
         *decision=1;
     }
     
-    if(strcmp(fpath,"bash")!=0 && strcmp(fpath,"sudo")!=0 ) //bash ÖÕ¶Ë sudo ÖÕ¶Ë
+    if(strcmp(fpath,"bash")!=0 && strcmp(fpath,"sudo")!=0 ) //bash ï¿½Õ¶ï¿½ sudo ï¿½Õ¶ï¿½
     {
         if(fpid==1)
         {
@@ -912,7 +937,7 @@ int getParentPid(int pid, int *decision)
         else if(fpid==2)
         {
             *decision=0;
-            return -1; //ÄÚºËÏß³Ì
+            return -1; //ï¿½Úºï¿½ï¿½ß³ï¿½
         }
         rpid = getParentPid(fpid, decision);
         if(rpid == 0)
@@ -924,8 +949,7 @@ int getParentPid(int pid, int *decision)
     return rpid;
 }
 
-/*ÅÐ¶Ïµ±Ç°·ÃÎÊ½ø³ÌÊÇÔÚhost»¹ÊÇguest
-static int checkSandbox(int pid_guest) {
+static int checkAuthority(int pid_guest) {
     //int decision = 0;
     char guestpid[64];
     char path[64];
@@ -948,11 +972,11 @@ static int checkSandbox(int pid_guest) {
         guestpid[len] = '\0';
     }
 
-    //boxÍâÃæ
+    //boxï¿½ï¿½ï¿½ï¿½
     if (strcmp(guestpid, hostpid) == 0) {
         return 1;
     }
-    //boxÀïÃæ
+    //boxï¿½ï¿½ï¿½ï¿½
     else{
         return 1;
     }
@@ -962,11 +986,132 @@ static int checkSandbox(int pid_guest) {
 }
 */
 
-int checkSandbox(int pid_guest) 
+static pid_t getParentPid(pid_t pid)
 {
-    return 1;
+  char statPath[MAX_PATH_STR] = {0};
+  char buf[MAX_PATH_STR] = {0};
+  char procName[MAX_PATH_STR]={0};
+  int fpid=0;
+  struct stat st;
+  ssize_t ret =0;
+
+  if (pid < 0)
+      return INVALID_PID;
+
+  sprintf(statPath,"/proc/%d/stat",pid);
+
+  if(stat(statPath,&st)!=0)
+  {
+      return INVALID_PID; 
+  }
+
+  FILE * fp = fopen(statPath,"r");
+  ret += fread(buf + ret,1,300-ret,fp);
+  fclose(fp);
+
+  sscanf(buf,"%*d %*c%s %*c %d %*s",procName,&fpid);
+
+  if (strlen(procName) > 0) {
+      procName[strlen(procName)-1]='\0';
+  }
+  //syslog(LOG_INFO, "procName=%s\n", procName);
+
+  return fpid;
 }
 
+int isInBox(fuse_req_t req, pid_t accessPid)
+{
+    char statPath[MAX_PATH_STR] = {0};
+    char buf[MAX_PATH_STR] = {0};
+    char procName[MAX_PATH_STR]={0};
+    pid_t pid =accessPid;
+    pid_t fpid = 0;
+    struct stat st;
+    ssize_t ret = 0;
+
+    while(1)
+    {
+        //idle
+        if(pid==0)
+        {
+            return true;
+        }
+        //systemd
+        if(pid==1)
+        {
+            syslog(LOG_INFO, "systemd:%d\n", accessPid);
+            return false;
+        }
+        //kthreadd
+        if(pid==2)
+        {
+            syslog(LOG_INFO, "kthreadd:%d\n", accessPid);
+            return false;
+        }
+
+        if(pid==gManagePid)
+        {
+            //syslog(LOG_INFO, "pid=%d, gManagePid=%d\n", pid, gManagePid);
+            return true;
+        }
+
+        sprintf(statPath,"/proc/%d/stat",pid);
+        if(stat(statPath,&st)!=0)
+        {
+            syslog(LOG_INFO, "stat fail:%s\n", statPath);
+            return false;
+        }
+
+        FILE * fp = fopen(statPath,"r");
+        ret += fread(buf + ret,1,300-ret,fp);
+        fclose(fp);
+
+        sscanf(buf,"%*d %*c%s %*c %d %*s",procName,&fpid);
+        procName[strlen(procName)-1]='\0';
+
+        //allow firejail --join
+        if(strncmp(procName, "firejail", strlen("firejail"))==0)
+        {
+            return true;
+        }
+        
+        pid = fpid;
+        memset(statPath,0,strlen(statPath));
+        memset(buf,0,strlen(buf));
+        memset(procName,0,strlen(procName));
+        ret = 0;
+    }
+
+    syslog(LOG_INFO, "End!\n");
+    return false;
+}
+
+static int checkAuthority(fuse_req_t req, fuse_ino_t ino)
+{
+    int fpid = 0;
+    bool flag = false;
+
+    if (UNLIKELY (ovl_debug (req)))
+    {
+        fprintf (stderr, "checkAuthority(pid=%d gManagePid=%d)\n", req->ctx.pid, gManagePid);
+    }
+
+    if (ino == FUSE_ROOT_ID)
+    {
+        return true;
+    }
+
+    flag = isInBox(req, req->ctx.pid);
+    if(!flag)
+    {
+        fprintf (stderr, "checkAuthority deny!\n");
+        syslog(LOG_INFO, "checkAuthority deny!\n");
+    }
+    //flag = true;
+    return flag;
+}
+
+//é˜²æ­¢æ­»å¾ªçŽ¯æŒ‚è½½
 int checkPath(struct ovl_data *lo, char *path) 
 {
     char *dirc;
@@ -977,6 +1122,7 @@ int checkPath(struct ovl_data *lo, char *path)
 
     if (0 == strncmp(path, dname+1, strlen(dname+1))) {
         fprintf(stderr, "CheckPath deny, path=%s\n", path);
+        //syslog(LOG_INFO, "CheckPath deny, path=%s\n", path);
         return 0;
     }
     else
@@ -1018,7 +1164,6 @@ int checkAccess(fuse_req_t req, struct ovl_data *lo, char *nodePath) {
         guestpid[len] = '\0';
     }
 
-    //boxÍâÃæ
     if (strcmp(guestpid, hostpid) == 0) {
         if(isBoxRunning)
         {
@@ -1064,7 +1209,6 @@ int checkAccess(fuse_req_t req, struct ovl_data *lo, char *nodePath) {
 
         */
     }
-    //boxÀïÃæ
     else{
         return checkPath(lo, nodePath);
     }
@@ -1213,6 +1357,15 @@ node_free (void *p)
   stats.nodes--;
   free (n->name);
   free (n->path);
+  free (n->cache.data);
+
+  EVP_CIPHER_CTX_free(n->block_enc);
+  EVP_CIPHER_CTX_free(n->block_dec);
+  EVP_CIPHER_CTX_free(n->stream_enc);
+  EVP_CIPHER_CTX_free(n->stream_dec);
+
+  pthread_mutex_destroy(&n->mutex);
+  
   free (n);
 }
 
@@ -1519,13 +1672,15 @@ ovl_forget (fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
   cleanup_lock int l = enter_big_lock ();
   struct ovl_data *lo = ovl_data (req);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
-      return;
-  }
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_forget(ino=%" PRIu64 ", nlookup=%lu)\n",
 	     ino, nlookup);
+
+  if (!checkAuthority(req, ino)) {
+      fuse_reply_err (req, ENOENT);
+      return;
+  }
+           
   do_forget (lo, ino, nlookup);
   fuse_reply_none (req);
 }
@@ -1540,11 +1695,6 @@ ovl_forget_multi (fuse_req_t req, size_t count, struct fuse_forget_data *forgets
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_forget_multi(count=%zu, forgets=%p)\n",
 	     count, forgets);
-
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
-      return;
-  }
 
   for (i = 0; i < count; i++)
     do_forget (lo, forgets[i].ino, forgets[i].nlookup);
@@ -1653,6 +1803,49 @@ safe_read_xattr (char **ret, int sfd, const char *name, size_t initial_size)
   return s;
 }
 
+void initCipherCtx(struct ovl_node *node)
+{
+    node->block_enc = EVP_CIPHER_CTX_new();
+    EVP_CIPHER_CTX_init(node->block_enc);
+    node->block_dec = EVP_CIPHER_CTX_new();
+    EVP_CIPHER_CTX_init(node->block_dec);
+    node->stream_enc = EVP_CIPHER_CTX_new();
+    EVP_CIPHER_CTX_init(node->stream_enc);
+    node->stream_dec = EVP_CIPHER_CTX_new();
+    EVP_CIPHER_CTX_init(node->stream_dec);
+
+    pthread_mutex_init(&node->mutex, NULL);
+
+    pthread_mutex_lock(&node->mutex);
+
+    // initialize the cipher context once so that we don't have to do it for every block..
+    EVP_EncryptInit_ex(node->block_enc, gSSLCipher.blockCipher, NULL, NULL, NULL);
+    EVP_DecryptInit_ex(node->block_dec, gSSLCipher.blockCipher, NULL, NULL, NULL);
+    EVP_EncryptInit_ex(node->stream_enc, gSSLCipher.streamCipher, NULL, NULL, NULL);
+    EVP_DecryptInit_ex(node->stream_dec, gSSLCipher.streamCipher, NULL, NULL, NULL);
+
+    EVP_CIPHER_CTX_set_key_length(node->block_enc, gSSLKey.keySize);
+    EVP_CIPHER_CTX_set_key_length(node->block_dec, gSSLKey.keySize);
+    EVP_CIPHER_CTX_set_key_length(node->stream_enc, gSSLKey.keySize);
+    EVP_CIPHER_CTX_set_key_length(node->stream_dec, gSSLKey.keySize);
+
+    EVP_CIPHER_CTX_set_padding(node->block_enc, 0);
+    EVP_CIPHER_CTX_set_padding(node->block_dec, 0);
+    EVP_CIPHER_CTX_set_padding(node->stream_enc, 0);
+    EVP_CIPHER_CTX_set_padding(node->stream_dec, 0);
+
+    EVP_EncryptInit_ex(node->block_enc, NULL, NULL, gSSLKey.buffer, NULL);
+    EVP_DecryptInit_ex(node->block_dec, NULL, NULL, gSSLKey.buffer, NULL);
+    EVP_EncryptInit_ex(node->stream_enc, NULL, NULL, gSSLKey.buffer, NULL);
+    EVP_DecryptInit_ex(node->stream_dec, NULL, NULL, gSSLKey.buffer, NULL);
+
+    node->cache.data = (unsigned char *)malloc(gBlockSize);
+    memset(node->cache.data, 0, gBlockSize);
+
+    pthread_mutex_unlock(&node->mutex);
+}
+
+
 static struct ovl_node *
 make_ovl_node (struct ovl_data *lo, const char *path, struct ovl_layer *layer, const char *name, ino_t ino, dev_t dev, bool dir_p, struct ovl_node *parent, bool fast_ino_check)
 {
@@ -1675,6 +1868,7 @@ make_ovl_node (struct ovl_data *lo, const char *path, struct ovl_layer *layer, c
   ret->next_link = NULL;
   ret->ino = NULL;
   ret->node_lookups = 0;
+  initCipherCtx(ret);
 
   new_name = strdup (name);
   if (new_name == NULL)
@@ -1912,11 +2106,11 @@ load_dir (struct ovl_data *lo, struct ovl_node *n, struct ovl_layer *layer, char
       if (ret == 0)
         break;
 
-      if (checkPath(lo, path)==0)
+      if (0 == checkPath(lo, path))
       {
           continue;
       }
-
+      
       dp = it->ds->opendir (it, path);
       if (dp == NULL)
         continue;
@@ -2231,7 +2425,7 @@ do_lookup_file (fuse_req_t req, struct ovl_data *lo, fuse_ino_t parent, const ch
   else
     pnode = inode_to_node (lo, parent);
   
-  if (0 == checkAccess(req, lo, pnode->path)) {
+  if (0 == checkPath(lo, pnode->path)) {
     return NULL;
   }
 
@@ -2364,10 +2558,11 @@ ovl_lookup (fuse_req_t req, fuse_ino_t parent, const char *name)
     fprintf (stderr, "ovl_lookup(parent=%" PRIu64 ", name=%s)\n",
 	     parent, name);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (!checkAuthority(req, parent)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
+
   memset (&e, 0, sizeof (e));
 
   node = do_lookup_file (req, lo, parent, name);
@@ -2379,6 +2574,9 @@ ovl_lookup (fuse_req_t req, fuse_ino_t parent, const char *name)
       fuse_reply_entry (req, &e);
       return;
     }
+
+  if (UNLIKELY (ovl_debug (req)))
+    fprintf (stderr, "ovl_lookup(child=%" PRIu64 ")\n", node->ino->ino);
 
   if (!lo->static_nlink && node_dirp (node))
     {
@@ -2466,8 +2664,8 @@ ovl_opendir (fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_opendir(ino=%" PRIu64 ")\n", ino);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (!checkAuthority(req, ino)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
 
@@ -2644,7 +2842,7 @@ ovl_do_readdir (fuse_req_t req, fuse_ino_t ino, size_t size,
             name = node->name;
           }
 
-        if (0 == checkAccess(req, lo, node->path)) {
+        if (0 == checkPath(lo, node->path)) {
           continue;
         }
   
@@ -2704,12 +2902,15 @@ ovl_readdir (fuse_req_t req, fuse_ino_t ino, size_t size,
 	    off_t offset, struct fuse_file_info *fi)
 {
   cleanup_lock int l = enter_big_lock ();
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
-      return;
-  }
+
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_readdir(ino=%" PRIu64 ", size=%zu, offset=%lo)\n", ino, size, offset);
+
+  if (!checkAuthority(req, ino)) {
+      fuse_reply_err (req, ENOENT);
+      return;
+  }
+    
   ovl_do_readdir (req, ino, size, offset, fi, 0);
 }
 
@@ -2718,12 +2919,15 @@ ovl_readdirplus (fuse_req_t req, fuse_ino_t ino, size_t size,
 		off_t offset, struct fuse_file_info *fi)
 {
   cleanup_lock int l = enter_big_lock ();
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
-      return;
-  }
+
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_readdirplus(ino=%" PRIu64 ", size=%zu, offset=%lo)\n", ino, size, offset);
+
+  if (!checkAuthority(req, ino)) {
+      fuse_reply_err (req, ENOENT);
+      return;
+  }
+
   ovl_do_readdir (req, ino, size, offset, fi, 1);
 }
 
@@ -2739,10 +2943,11 @@ ovl_releasedir (fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_releasedir(ino=%" PRIu64 ")\n", ino);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (!checkAuthority(req, ino)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
+
   for (s = 2; s < d->tbl_size; s++)
     {
       d->tbl[s]->node_lookups--;
@@ -2810,8 +3015,8 @@ ovl_listxattr (fuse_req_t req, fuse_ino_t ino, size_t size)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_listxattr(ino=%" PRIu64 ", size=%zu)\n", ino, size);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (!checkAuthority(req, ino)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
 
@@ -2873,8 +3078,8 @@ ovl_getxattr (fuse_req_t req, fuse_ino_t ino, const char *name, size_t size)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_getxattr(ino=%" PRIu64 ", name=%s, size=%zu)\n", ino, name, size);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (!checkAuthority(req, ino)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
 
@@ -2941,10 +3146,11 @@ ovl_access (fuse_req_t req, fuse_ino_t ino, int mask)
     fprintf (stderr, "ovl_access(ino=%" PRIu64 ", mask=%d)\n",
 	     ino, mask);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (!checkAuthority(req, ino)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
+
   if ((mask & n->ino->mode) == mask)
     fuse_reply_err (req, 0);
   else
@@ -3211,8 +3417,860 @@ create_node_directory (struct ovl_data *lo, struct ovl_node *src)
   return ret;
 }
 
-static int
-copy_fd_to_fd (int sfd, int dfd, char *buf, size_t buf_size)
+#define min(x, y) ((x) < (y) ? (x) : (y))
+
+static int reply_buf_limited(fuse_req_t req, const char *buf, size_t bufsize,
+			     off_t off, size_t maxsize)
+{
+	if (off < bufsize)
+		return fuse_reply_buf(req, buf + off,
+				      min(bufsize - off, maxsize));
+	else
+		return fuse_reply_buf(req, NULL, 0);
+}
+
+void setIVec(unsigned char *ivec, uint64_t seed)
+{
+    int i = 0;
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int mdLen = EVP_MAX_MD_SIZE;
+
+    memcpy(ivec, gSSLKey.buffer+gSSLKey.keySize, gSSLKey.ivLength);
+
+    for (i; i < 8; ++i) {
+        md[i] = (unsigned char)(seed & 0xff);
+        seed >>= 8;
+    }
+
+    // combine ivec and seed with HMAC
+    HMAC_Init_ex(gSSLKey.mac_ctx, NULL, 0, NULL, NULL);
+    HMAC_Update(gSSLKey.mac_ctx, ivec, gSSLKey.ivLength);
+    HMAC_Update(gSSLKey.mac_ctx, md, 8);
+    HMAC_Final(gSSLKey.mac_ctx, md, &mdLen);
+
+    memcpy(ivec, md, gSSLKey.ivLength);
+}
+
+static void flipBytes(unsigned char *buf, int size)
+{
+    int i = 0;
+    unsigned char revBuf[64];
+
+    int bytesLeft = size;
+    while (bytesLeft != 0) {
+        int toFlip = min(sizeof(revBuf), bytesLeft);
+
+        for (i = 0; i < toFlip; ++i) {
+            revBuf[i] = buf[toFlip - (i + 1)];
+        }
+
+        memcpy(buf, revBuf, toFlip);
+        bytesLeft -= toFlip;
+        buf += toFlip;
+    }
+    memset(revBuf, 0, sizeof(revBuf));
+}
+
+static void shuffleBytes(unsigned char *buf, int size)
+{
+    int i = 0;
+
+    for (i = 0; i < size - 1; ++i) {
+        buf[i + 1] ^= buf[i];
+    }
+}
+
+static void unshuffleBytes(unsigned char *buf, int size)
+{
+    int i = 0;
+
+    for (i = size - 1; i != 0; --i) {
+        buf[i] ^= buf[i - 1];
+    }
+}
+
+/** Partial blocks are encoded with a stream cipher.  We make multiple passes on
+ the data to ensure that the ends of the data depend on each other.
+*/
+bool streamEncode(fuse_req_t req, struct ovl_node *node, unsigned char *buf, int size, uint64_t iv64)
+{
+  unsigned char ivec[MAX_IVLENGTH];
+  int dstLen = 0, tmpLen = 0;
+
+  pthread_mutex_lock(&node->mutex);
+
+  shuffleBytes(buf, size);
+
+  setIVec(ivec, iv64);
+  EVP_EncryptInit_ex(node->stream_enc, NULL, NULL, NULL, ivec);
+  EVP_EncryptUpdate(node->stream_enc, buf, &dstLen, buf, size);
+  EVP_EncryptFinal_ex(node->stream_enc, buf + dstLen, &tmpLen);
+
+  flipBytes(buf, size);
+  shuffleBytes(buf, size);
+
+  setIVec(ivec, iv64 + 1);
+  EVP_EncryptInit_ex(node->stream_enc, NULL, NULL, NULL, ivec);
+  EVP_EncryptUpdate(node->stream_enc, buf, &dstLen, buf, size);
+  EVP_EncryptFinal_ex(node->stream_enc, buf + dstLen, &tmpLen);
+
+  dstLen += tmpLen;
+
+  pthread_mutex_unlock(&node->mutex);
+  if (dstLen != size)
+  {
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf (stderr,  "encoding %d bytes, got back %d (%d in final_ex)\n", size, dstLen, tmpLen);
+    }
+    return false;
+  }
+
+  return true;
+}
+
+bool streamDecode(fuse_req_t req, struct ovl_node *node, unsigned char *buf, int size, uint64_t iv64)
+{
+  unsigned char ivec[MAX_IVLENGTH];
+  int dstLen = 0, tmpLen = 0;
+
+  pthread_mutex_lock(&node->mutex);
+
+  setIVec(ivec, iv64 + 1);
+  EVP_DecryptInit_ex(node->stream_dec, NULL, NULL, NULL, ivec);
+  EVP_DecryptUpdate(node->stream_dec, buf, &dstLen, buf, size);
+  EVP_DecryptFinal_ex(node->stream_dec, buf + dstLen, &tmpLen);
+
+  unshuffleBytes(buf, size);
+  flipBytes(buf, size);
+
+  setIVec(ivec, iv64);
+  EVP_DecryptInit_ex(node->stream_dec, NULL, NULL, NULL, ivec);
+  EVP_DecryptUpdate(node->stream_dec, buf, &dstLen, buf, size);
+  EVP_DecryptFinal_ex(node->stream_dec, buf + dstLen, &tmpLen);
+
+  unshuffleBytes(buf, size);
+  dstLen += tmpLen;
+
+  pthread_mutex_unlock(&node->mutex);
+  
+  if (dstLen != size)
+  {
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf (stderr,  "decoding %d bytes, got back %d (%d in final_ex)\n", size, dstLen, tmpLen);
+    }
+    return false;
+  }
+
+  return true;
+}
+
+bool blockEncode(fuse_req_t req, struct ovl_node *node, unsigned char *buf, int size, uint64_t iv64)
+{
+  unsigned char ivec[MAX_IVLENGTH];
+  int dstLen = 0, tmpLen = 0;
+
+  // data must be integer number of blocks
+  const int blockMod = size % EVP_CIPHER_CTX_block_size(node->block_enc);
+  if (blockMod != 0) {
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf (stderr, "Invalid data size, not multiple of block size\n");
+    }
+    return false;
+  }
+
+  pthread_mutex_lock(&node->mutex);
+  setIVec(ivec, iv64);
+
+  EVP_EncryptInit_ex(node->block_enc, NULL, NULL, NULL, ivec);
+  EVP_EncryptUpdate(node->block_enc, buf, &dstLen, buf, size);
+  EVP_EncryptFinal_ex(node->block_enc, buf + dstLen, &tmpLen);
+  dstLen += tmpLen;
+
+  pthread_mutex_unlock(&node->mutex);
+
+  if (dstLen != size)
+  {
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf (stderr,  "encoding %d bytes, got back %d (%d in final_ex)\n", size, dstLen, tmpLen);
+    }
+    return false;
+  }
+
+  return true;
+}
+
+bool blockDecode(fuse_req_t req, struct ovl_node *node, unsigned char *buf, int size, uint64_t iv64)
+{
+  unsigned char ivec[MAX_IVLENGTH];
+  int dstLen = 0, tmpLen = 0;
+
+  // data must be integer number of blocks
+  const int blockMod = size % EVP_CIPHER_CTX_block_size(node->block_dec);
+  if (blockMod != 0) {
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf (stderr, "Invalid data size, not multiple of block size\n");
+    }
+    return false;
+  }
+
+  pthread_mutex_lock(&node->mutex);
+  setIVec(ivec, iv64);
+
+  EVP_DecryptInit_ex(node->block_dec, NULL, NULL, NULL, ivec);
+  EVP_DecryptUpdate(node->block_dec, buf, &dstLen, buf, size);
+  EVP_DecryptFinal_ex(node->block_dec, buf + dstLen, &tmpLen);
+  dstLen += tmpLen;
+
+  pthread_mutex_unlock(&node->mutex);
+
+  if (dstLen != size)
+  {
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf (stderr,  "decoding %d bytes, got back %d (%d in final_ex)\n", size, dstLen, tmpLen);
+    }
+    return false;
+  }
+
+  return true;
+}
+
+void printhex(unsigned char *src,int len)
+{
+    int i=0;
+
+    if(src==NULL)
+    {
+        return;
+    }
+
+    for(i=0;i<len;i++)
+    {
+        fprintf (stderr, "%02X", src[i]);
+    }
+
+    return;
+}
+
+/**
+ * Read block from backing ciphertext file, decrypt it (normal mode)
+ * or
+ * Read block from backing plaintext file, then encrypt it (reverse mode)
+ */
+ssize_t readOneBlock(fuse_req_t req, struct ovl_node *node, const struct IORequest *blockReq)
+{
+  bool ok;
+  int i = 0;
+  off_t blockNum = blockReq->offset / gBlockSize;
+
+  ssize_t readSize = pread(blockReq->fd, blockReq->data, blockReq->dataLen, blockReq->offset);
+  if (readSize < 0) {
+    int eno = errno;
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf (stderr, "read failed at fd %d offset %d for %d bytes: %s\n", blockReq->fd, blockReq->offset, blockReq->dataLen, strerror(eno));
+    }
+    readSize = -eno;
+  }
+
+  if (UNLIKELY (ovl_debug (req)))
+  {
+    fprintf (stderr, "readOneBlock raw(%d)", readSize);
+    //printhex((unsigned char*)blockReq->data, readSize);
+    fprintf (stderr, "\n");
+  }
+
+  if (readSize > 0)
+  {
+    if (readSize != gBlockSize)
+    {
+      ok = streamDecode(req, node, blockReq->data, (int)readSize, blockNum ^ 0);
+      // cast works because we work on a block and blocksize fit an int
+    }
+    else
+    {
+      if (gAllowHoles) {
+        // special case - leave all 0's alone
+        for (i = 0; i < readSize; ++i) {
+          if (blockReq->data[i] != 0) {
+            ok = blockDecode(req, node, blockReq->data, (int)readSize, blockNum ^ 0);
+            break;
+          }
+        }
+        ok = true;
+      }
+      else
+      {
+        ok = blockDecode(req, node, blockReq->data, (int)readSize, blockNum ^ 0);
+      }
+    }
+
+    if (!ok) {
+      if (UNLIKELY (ovl_debug (req)))
+      {
+        fprintf (stderr, "decodeBlock failed for block %d, size %d\n", blockNum, readSize);
+      }
+      readSize = -EBADMSG;
+    }
+  }
+  else if (readSize == 0)
+  {
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf (stderr, "readSize zero for offset %d\n", blockReq->offset);
+    }
+  }
+
+  if (UNLIKELY (ovl_debug (req)))
+  {
+    fprintf (stderr, "readOneBlock decode ok=%d(%d)", ok, readSize);
+    //printhex((unsigned char*)blockReq->data, readSize);
+    fprintf (stderr, "\n");
+  }
+
+  return readSize;
+}
+
+ssize_t writeOneBlock(fuse_req_t req, struct ovl_node *node, const struct IORequest *blockReq)
+{
+    bool ok;
+    ssize_t res = 0;
+    void *buf = blockReq->data;
+    ssize_t bytes = blockReq->dataLen;
+    off_t offset = blockReq->offset;
+    off_t blockNum = blockReq->offset / gBlockSize;
+
+    if (blockReq->dataLen != gBlockSize) {
+        ok = streamEncode(req, node, blockReq->data, (int)blockReq->dataLen, blockNum ^ 0);
+        // cast works because we work on a block and blocksize fit an int
+    } else {
+        ok = blockEncode(req, node, blockReq->data, (int)blockReq->dataLen, blockNum ^ 0);
+        // cast works because we work on a block and blocksize fit an int
+    }
+    
+    if (UNLIKELY (ovl_debug (req)))
+    {
+        fprintf (stderr, "writeOneBlock encode ok=%d(%d):", ok, blockReq->dataLen);
+        //printhex((unsigned char*)blockReq->data, blockReq->dataLen);
+        fprintf (stderr, "\n");
+    }
+
+    if (ok)
+    {
+        while (bytes != 0) {
+            if (UNLIKELY (ovl_debug (req)))
+            {
+                fprintf (stderr, "pwrite at offset %d for %d bytes:%X\n", offset, bytes, *blockReq->data);
+            }
+            ssize_t writeSize = pwrite(blockReq->fd, buf, bytes, offset);
+
+            if (writeSize < 0) {
+                int eno = errno;
+                if (UNLIKELY (ovl_debug (req)))
+                {
+                    fprintf (stderr, "pwrite failed at offset %d for %d bytes: %s\n", offset, bytes, strerror(eno));
+                }
+                // pwrite is not expected to return 0, so eno should always be set, but we never know...
+                return -eno;
+            }
+            if (writeSize == 0) {
+                return -EIO;
+            }
+
+            bytes -= writeSize;
+            offset += writeSize;
+            buf = (void *)((char *)buf + writeSize);
+        }
+        return blockReq->dataLen;
+    } else {
+        if (UNLIKELY (ovl_debug (req)))
+        {
+            fprintf (stderr, "encodeBlock failed for block %d, size %d\n", blockNum, blockReq->dataLen);
+        }
+        res = -EBADMSG;
+    }
+
+    return res;
+}
+
+static void clearCache(struct IORequest *req, unsigned int blockSize)
+{
+  memset(req->data, 0, blockSize);
+  req->dataLen = 0;
+}
+
+/**
+ * Serve a read request for the size of one block or less,
+ * at block-aligned offsets.
+ * Always requests full blocks form the lower layer, truncates the
+ * returned data as neccessary.
+ */
+ssize_t cacheReadOneBlock(fuse_req_t req, struct ovl_node *node, const struct IORequest *blockReq)
+{
+  /* we can satisfy the request even if _cache.dataLen is too short, because
+   * we always request a full block during reads. This just means we are
+   * in the last block of a file, which may be smaller than the blocksize.
+   * For reverse encryption, the cache must not be used at all, because
+   * the lower file may have changed behind our back. */
+  if ((blockReq->offset == node->cache.offset) && (node->cache.dataLen != 0)) {
+    // satisfy request from cache
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf(stderr, "Read from cache offset=%d, dataLen=%d\n", node->cache.offset, node->cache.dataLen);
+    }
+    size_t len = blockReq->dataLen;
+    if (node->cache.dataLen < len) {
+      len = node->cache.dataLen;  // Don't read past EOF
+    }
+    memcpy(blockReq->data, node->cache.data, len);
+    return len;
+  }
+  
+  if (node->cache.dataLen > 0)
+  {
+    clearCache(&node->cache, gBlockSize);
+  }
+
+  // cache results of read -- issue reads for full blocks
+  struct IORequest tmp;
+  tmp.fd = blockReq->fd;
+  tmp.offset = blockReq->offset;
+  tmp.data = node->cache.data;
+  tmp.dataLen = gBlockSize;
+  ssize_t result = readOneBlock(req, node, &tmp);
+  if (result > 0) {
+    node->cache.offset = blockReq->offset;
+    node->cache.dataLen = result;  // the amount we really have
+    if ((size_t)result > blockReq->dataLen) {
+      result = blockReq->dataLen;  // only as much as requested
+    }
+    memcpy(blockReq->data, node->cache.data, result);
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf(stderr, "cacheReadOneBlock save cache: offset=%d, dataLen=%d data=%s\n", blockReq->offset, blockReq->dataLen, blockReq->data);
+    }
+  }
+  return result;
+}
+
+ssize_t cacheWriteOneBlock(fuse_req_t req, struct ovl_node *node, const struct IORequest *blockReq)
+{
+  // Let's point request buffer to our own buffer, as it may be modified by
+  // encryption : originating process may not like to have its buffer modified
+  memcpy(node->cache.data, blockReq->data, blockReq->dataLen);
+  struct IORequest tmp;
+  tmp.fd = blockReq->fd;
+  tmp.offset = blockReq->offset;
+  tmp.data = node->cache.data;
+  tmp.dataLen = blockReq->dataLen;
+  ssize_t res = writeOneBlock(req, node, &tmp);
+  if (res < 0) {
+    clearCache(&node->cache, gBlockSize);
+  }
+  else {
+    // And now we can cache the write buffer from the request
+    memcpy(node->cache.data, blockReq->data, blockReq->dataLen);
+    node->cache.offset = blockReq->offset;
+    node->cache.dataLen = blockReq->dataLen;
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf(stderr, "cacheWriteOneBlock save cache: offset=%d, dataLen=%d\n", blockReq->offset, blockReq->dataLen);
+    }
+  }
+  return res;
+}
+
+ssize_t readBlocks(fuse_req_t req, struct ovl_node *node, const struct IORequest *blockReq)
+{
+    int partialOffset = blockReq->offset % gBlockSize;  // can be int as _blockSize is int
+    off_t blockNum = blockReq->offset / gBlockSize;
+    ssize_t result = 0;
+    BUF_MEM *data = NULL;
+
+    if (partialOffset == 0 && blockReq->dataLen <= gBlockSize)
+    {
+        // read completely within a single block -- can be handled as-is by readOneBlock().
+        return cacheReadOneBlock(req, node, blockReq);
+    }
+    size_t size = blockReq->dataLen;
+
+    // if the request is larger than a block, then request each block individually
+    struct IORequest tmp;  // for requests we may need to make
+    tmp.fd = blockReq->fd;
+    tmp.dataLen = gBlockSize;
+    tmp.data = NULL;
+
+    unsigned char *out = blockReq->data;
+    while (size != 0u)
+    {
+        tmp.offset = blockNum * gBlockSize;
+        if (UNLIKELY (ovl_debug (req)))
+        {
+            fprintf(stderr, "readBlocks: offset=%d, dataLen=%d\n", tmp.offset, tmp.dataLen);
+        }
+        
+        // if we're reading a full block, then read directly into the
+        // result buffer instead of using a temporary
+        if (partialOffset == 0 && size >= gBlockSize)
+        {
+            tmp.data = out;
+        }
+        else
+        {
+            if (data == NULL)
+            {
+                data = BUF_MEM_new();
+                BUF_MEM_grow(data, gBlockSize);
+            }
+            tmp.data = (unsigned char *)(data->data);
+        }
+
+        ssize_t readSize = cacheReadOneBlock(req, node, &tmp);
+        if (readSize < 0) {
+            result = readSize;
+            break;
+        }
+        if (readSize <= partialOffset) {
+            break;  // didn't get enough bytes
+        }
+
+        size_t cpySize = min((size_t)readSize - (size_t)partialOffset, size);
+        CHECK(cpySize <= (size_t)readSize);
+
+        // if we read to a temporary buffer, then move the data
+        if (tmp.data != out) {
+            memcpy(out, tmp.data + partialOffset, cpySize);
+        }
+
+        result += cpySize;
+        size -= cpySize;
+        out += cpySize;
+        ++blockNum;
+        partialOffset = 0;
+
+        if ((size_t)readSize < gBlockSize) {
+            break;
+        }
+    }
+
+    if (data != NULL) {
+        BUF_MEM_free(data);
+    }
+
+    return result;
+}
+
+int padFile(fuse_req_t req, struct ovl_node *node, int fd, off_t oldSize, off_t newSize, bool forceWrite)
+{
+  struct IORequest blockReq;
+  ssize_t res = 0;
+  BUF_MEM *data = NULL;
+
+  off_t oldLastBlock = oldSize / gBlockSize;
+  off_t newLastBlock = newSize / gBlockSize;
+  int newBlockSize = newSize % gBlockSize;  // can be int as _blockSize is int
+
+  if (oldLastBlock == newLastBlock) {
+    // when the real write occurs, it will have to read in the existing
+    // data and pad it anyway, so we won't do it here (unless we're
+    // forced).
+    if (UNLIKELY (ovl_debug (req)))
+    {
+      fprintf(stderr, "optimization: not padding last block\n");
+    }
+  } else {
+    data = BUF_MEM_new();
+    BUF_MEM_grow(data, gBlockSize);
+    blockReq.data = (unsigned char *)(data->data);
+
+    // 1. extend the first block to full length
+    // 2. write the middle empty blocks
+    // 3. write the last block
+
+    blockReq.fd = fd;
+    blockReq.offset = oldLastBlock * gBlockSize;
+    blockReq.dataLen = oldSize % gBlockSize;
+
+    // 1. req.dataLen == 0, iff oldSize was already a multiple of blocksize
+    if (blockReq.dataLen != 0) {
+      if (UNLIKELY (ovl_debug (req)))
+      {
+        fprintf (stderr, "padding block %d\n", oldLastBlock);
+      }
+      memset(data, 0, gBlockSize);
+      if ((res = cacheReadOneBlock(req, node, &blockReq)) >= 0) {
+        blockReq.dataLen = gBlockSize;  // expand to full block size
+        res = cacheWriteOneBlock(req, node, &blockReq);
+      }
+      ++oldLastBlock;
+    }
+
+    // 2, pad zero blocks unless holes are allowed
+    if (!gAllowHoles) {
+      for (; (res >= 0) && (oldLastBlock != newLastBlock); ++oldLastBlock) {
+        if (UNLIKELY (ovl_debug (req)))
+        {
+          fprintf (stderr, "padding block %d\n", oldLastBlock);
+        }
+        blockReq.offset = oldLastBlock * gBlockSize;
+        blockReq.dataLen = gBlockSize;
+        memset(data, 0, blockReq.dataLen);
+        res = cacheWriteOneBlock(req, node, &blockReq);
+      }
+    }
+
+    // 3. only necessary if write is forced and block is non 0 length
+    if ((res >= 0) && forceWrite && (newBlockSize != 0)) {
+      blockReq.offset = newLastBlock * gBlockSize;
+      blockReq.dataLen = newBlockSize;
+      memset(data, 0, blockReq.dataLen);
+      res = cacheWriteOneBlock(req, node, &blockReq);
+    }
+  }
+
+  if (data != NULL) {
+    BUF_MEM_free(data);
+  }
+
+  if (res < 0) {
+    return res;
+  }
+  return 0;
+}
+
+/**
+ * Returns the number of bytes written, or -errno in case of failure.
+ */
+ssize_t writeBlocks(fuse_req_t req, struct ovl_node *node, off_t fileSize, const struct IORequest *blockReq)
+{
+  BUF_MEM *data = NULL;
+  
+  // where write request begins
+  off_t blockNum = blockReq->offset / gBlockSize;
+  int partialOffset = blockReq->offset % gBlockSize;  // can be int as _blockSize is int
+
+  // last block of file (for testing write overlaps with file boundary)
+  off_t lastFileBlock = fileSize / gBlockSize;
+  size_t lastBlockSize = fileSize % gBlockSize;
+
+  if (UNLIKELY (ovl_debug (req)))
+  {
+    fprintf(stderr, "writeBlocks:fd=%d fileSize=%d lastBlockSize=%d\n", blockReq->fd, fileSize, lastBlockSize);
+  }
+
+  off_t lastNonEmptyBlock = lastFileBlock;
+  if (lastBlockSize == 0) {
+    --lastNonEmptyBlock;
+  }
+
+  if (blockReq->offset > fileSize) {
+    // extend file first to fill hole with 0's..
+    int res = padFile(req, node, blockReq->fd, fileSize, blockReq->offset, false);
+    if (res < 0) {
+      return res;
+    }
+  }
+
+  // check against edge cases where we can just let the base class handle the request as-is..
+  if (partialOffset == 0 && blockReq->dataLen <= gBlockSize) {
+    // if writing a full block.. pretty safe..
+    if (blockReq->dataLen == gBlockSize) {
+      return cacheWriteOneBlock(req, node, blockReq);
+    }
+
+    // if writing a partial block, but at least as much as what is already there..
+    if (blockNum == lastFileBlock && blockReq->dataLen >= lastBlockSize) {
+      return cacheWriteOneBlock(req, node, blockReq);
+    }
+  }
+
+  // have to merge data with existing block(s)..
+  struct IORequest tmp;
+  tmp.fd = blockReq->fd;
+  tmp.data = NULL;
+  tmp.dataLen = gBlockSize;
+
+  ssize_t res = 0;
+  size_t size = blockReq->dataLen;
+  unsigned char *inPtr = blockReq->data;
+  while (size != 0u) {
+    tmp.offset = blockNum * gBlockSize;
+    size_t toCopy = min((size_t)gBlockSize - (size_t)partialOffset, size);
+
+    // if writing an entire block, or writing a partial block that requires no merging with existing data..
+    if ((toCopy == gBlockSize) || (partialOffset == 0 && tmp.offset + (off_t)toCopy >= fileSize))
+    {
+      // write directly from buffer
+      tmp.data = inPtr;
+      tmp.dataLen = toCopy;
+    } else {
+      // need a temporary buffer, since we have to either merge or pad the data.
+      if (data == NULL)
+      {
+          data = BUF_MEM_new();
+          BUF_MEM_grow(data, gBlockSize);
+      }
+      memset(data->data, 0, gBlockSize);
+      tmp.data = (unsigned char *)(data->data);
+
+      if (blockNum > lastNonEmptyBlock) {
+        // just pad..
+        tmp.dataLen = partialOffset + toCopy;
+      } else {
+        // have to merge with existing block data..
+        tmp.dataLen = gBlockSize;
+        ssize_t readSize = cacheReadOneBlock(req, node, &tmp);
+        if (readSize < 0) {
+          res = readSize;
+          break;
+        }
+        tmp.dataLen = readSize;
+
+        // extend data if necessary..
+        if (partialOffset + toCopy > tmp.dataLen) {
+          tmp.dataLen = partialOffset + toCopy;
+        }
+      }
+      // merge in the data to be written..
+      memcpy(tmp.data + partialOffset, inPtr, toCopy);
+    }
+
+    // Finally, write the damn thing!
+    res = cacheWriteOneBlock(req, node, &tmp);
+    if (res < 0) {
+      break;
+    }
+
+    // prepare to start all over with the next block..
+    size -= toCopy;
+    inPtr += toCopy;
+    ++blockNum;
+    partialOffset = 0;
+  }
+
+  if (data != NULL) {
+      BUF_MEM_free(data);
+  }
+
+  if (res < 0) {
+    return res;
+  }
+  return blockReq->dataLen;
+}
+
+ssize_t fileEncode(fuse_req_t req, struct ovl_node *node, int sfd, int dfd, off_t fileSize)
+{
+    BUF_MEM *data = NULL;
+    size_t blockIndex = 0;
+    ssize_t res = 0;
+    ssize_t total = 0;
+    struct IORequest tmp;
+
+    if (fileSize <= 0) {
+      return fileSize;
+    }
+
+    // last block of file (for testing write overlaps with file boundary)
+    off_t lastFileBlock = fileSize / gBlockSize;
+    size_t lastBlockSize = fileSize % gBlockSize;
+
+    if (UNLIKELY (ovl_debug (req)))
+    {
+        fprintf(stderr, "fileEncode:dfd=%d fileSize=%d lastBlockSize=%d\n", dfd, fileSize, lastBlockSize);
+    }
+
+    off_t lastNonEmptyBlock = lastFileBlock;
+    if (lastBlockSize == 0) {
+        --lastNonEmptyBlock;
+    }
+
+    data = BUF_MEM_new();
+    BUF_MEM_grow(data, gBlockSize);
+    tmp.fd = dfd;
+    tmp.data = (unsigned char *)(data->data);
+    for (blockIndex = 0; blockIndex <= lastNonEmptyBlock; blockIndex++)
+    {
+        tmp.offset = blockIndex * gBlockSize;
+        if (blockIndex == lastNonEmptyBlock && lastBlockSize>0)
+        {
+            tmp.dataLen = lastBlockSize;
+        }
+        else
+        {
+            tmp.dataLen = gBlockSize;
+        }
+        memset(tmp.data, 0, gBlockSize);
+        ssize_t readSize = pread(sfd, tmp.data, tmp.dataLen, tmp.offset);
+        if (readSize < 0) {
+            int eno = errno;
+            if (UNLIKELY (ovl_debug (req)))
+            {
+                fprintf (stderr, "read failed at fd %d offset %d for %d bytes: %s\n", sfd, tmp.offset, tmp.dataLen, strerror(eno));
+            }
+            readSize = -eno;
+        }
+        assert(readSize==tmp.dataLen);
+        res = writeOneBlock(req, node, &tmp);
+        if (res < 0) {
+            break;
+        }
+        total += tmp.dataLen;
+    }
+
+    assert(total==fileSize);
+
+    if (data != NULL) {
+        BUF_MEM_free(data);
+    }
+
+    if (res < 0) {
+        return res;
+    }
+    
+    return total;
+}
+
+static int encode_fd_to_fd (fuse_req_t req, struct ovl_node *node, int sfd, int dfd, char *buf, size_t buf_size, off_t fileSize)
+{
+    int ret;
+    int nread = 0;
+    int written = 0;
+    ssize_t total = 0;
+    struct IORequest tmp;
+
+    tmp.fd = dfd;
+    tmp.data = (unsigned char *)buf;
+    tmp.offset = 0;
+    for (;;)
+    {
+        memset(buf, 0, buf_size);
+        nread = TEMP_FAILURE_RETRY (read (sfd, buf, gBlockSize));
+        if (nread < 0)
+            return nread;
+
+        if (nread == 0)
+            break;
+
+        tmp.dataLen = nread;
+        written = writeOneBlock(req, node, &tmp);
+        if (written < 0) {
+            break;
+        }
+        assert(written==nread);
+        total += written;
+        tmp.offset += nread;
+    }
+
+    assert(total==fileSize);
+    return 0;
+}
+
+static int copy_fd_to_fd (int sfd, int dfd, char *buf, size_t buf_size)
 {
   int ret;
 
@@ -3243,20 +4301,25 @@ copy_fd_to_fd (int sfd, int dfd, char *buf, size_t buf_size)
 }
 
 static int
-copyup (struct ovl_data *lo, struct ovl_node *node)
+copyup (fuse_req_t req, struct ovl_data *lo, struct ovl_node *node)
 {
   int saved_errno;
   int ret = -1;
   cleanup_close int dfd = -1;
   cleanup_close int sfd = -1;
+  cleanup_close int ufd = -1;
   struct stat st;
   const size_t buf_size = 1 << 20;
   cleanup_free char *buf = NULL;
   struct timespec times[2];
   char wd_tmp_file_name[32];
-  static bool support_reflinks = true;
-  bool data_copied = false;
+  //static bool support_reflinks = true;
+  //bool data_copied = false;
   mode_t mode;
+  struct ovl_layer *l;
+
+  if (UNLIKELY (ovl_debug (req)))
+    fprintf (stderr, "copyup(ino=%" PRIu64 ", name=%s)\n", node->ino->ino, node->path);
 
   sprintf (wd_tmp_file_name, "%lu", get_next_wd_counter ());
 
@@ -3317,7 +4380,7 @@ copyup (struct ovl_data *lo, struct ovl_node *node)
   if (sfd < 0)
     goto exit;
 
-  ret = dfd = TEMP_FAILURE_RETRY (safe_openat (lo->workdir_fd, wd_tmp_file_name, O_CREAT|O_WRONLY, mode));
+  ret = dfd = TEMP_FAILURE_RETRY (safe_openat (lo->workdir_fd, wd_tmp_file_name, O_CREAT|O_RDWR, mode));
   if (dfd < 0)
     goto exit;
 
@@ -3332,13 +4395,14 @@ copyup (struct ovl_data *lo, struct ovl_node *node)
   if (buf == NULL)
     goto exit;
 
+  /*
   if (support_reflinks)
     {
       if (ioctl (dfd, FICLONE, sfd) >= 0)
         data_copied = true;
       else if (errno == ENOTSUP || errno == EINVAL)
         {
-          /* Fallback to data copy and don't attempt again FICLONE.  */
+          // Fallback to data copy and don't attempt again FICLONE.
           support_reflinks = false;
         }
     }
@@ -3354,7 +4418,7 @@ copyup (struct ovl_data *lo, struct ovl_node *node)
           ssize_t n = TEMP_FAILURE_RETRY (sendfile (dfd, sfd, NULL, tocopy > SIZE_MAX ? SIZE_MAX : (size_t) tocopy));
           if (n < 0)
             {
-              /* On failure, fallback to the read/write loop.  */
+              // On failure, fallback to the read/write loop.
               ret = copy_fd_to_fd (sfd, dfd, buf, buf_size);
               if (ret < 0)
                 goto exit;
@@ -3372,6 +4436,10 @@ copyup (struct ovl_data *lo, struct ovl_node *node)
       if (ret < 0)
         goto exit;
     }
+  */
+  ret = encode_fd_to_fd (req, node, sfd, dfd, buf, buf_size, st.st_size);
+  if (ret < 0)
+    goto exit;
 
   times[0] = st.st_atim;
   times[1] = st.st_mtim;
@@ -3388,6 +4456,14 @@ copyup (struct ovl_data *lo, struct ovl_node *node)
     goto exit;
 
   /* Finally, move the file to its destination.  */
+  /*
+  l = get_upper_layer (lo);
+  ufd = l->ds->openat (l, node->path, O_CREAT|O_WRONLY, mode);
+  ret = fileEncode(req, node, dfd, dfd, st.st_size);
+  if (ret < 0)
+    goto exit;
+  */
+
   ret = renameat (lo->workdir_fd, wd_tmp_file_name, get_upper_layer (lo)->fd, node->path);
   if (ret < 0)
     goto exit;
@@ -3417,7 +4493,7 @@ copyup (struct ovl_data *lo, struct ovl_node *node)
 }
 
 static struct ovl_node *
-get_node_up (struct ovl_data *lo, struct ovl_node *node)
+get_node_up (fuse_req_t req, struct ovl_data *lo, struct ovl_node *node)
 {
   int ret;
 
@@ -3430,7 +4506,7 @@ get_node_up (struct ovl_data *lo, struct ovl_node *node)
   if (node->layer == get_upper_layer (lo))
     return node;
 
-  ret = copyup (lo, node);
+  ret = copyup (req, lo, node);
   if (ret < 0)
     return NULL;
 
@@ -3578,7 +4654,7 @@ do_rm (fuse_req_t req, fuse_ino_t parent, const char *name, bool dirp)
       return;
     }
 
-  pnode = get_node_up (lo, pnode);
+  pnode = get_node_up (req, lo, pnode);
   if (pnode == NULL)
     {
       fuse_reply_err (req, errno);
@@ -3588,7 +4664,7 @@ do_rm (fuse_req_t req, fuse_ino_t parent, const char *name, bool dirp)
   /* If the node is still accessible then be sure we
      can write to it.  Fix it to be done when a write is
      really done, not now.  */
-  node = get_node_up (lo, node);
+  node = get_node_up (req, lo, node);
   if (node == NULL)
     {
       fuse_reply_err (req, errno);
@@ -3617,14 +4693,16 @@ static void
 ovl_unlink (fuse_req_t req, fuse_ino_t parent, const char *name)
 {
   cleanup_lock int l = enter_big_lock ();
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
-      return;
-  }
 
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_unlink(parent=%" PRIu64 ", name=%s)\n",
 	     parent, name);
+  
+  if (!checkAuthority(req, parent)) {
+    fuse_reply_err (req, ENOENT);
+    return;
+  }
+
   do_rm (req, parent, name, false);
 }
 
@@ -3632,14 +4710,16 @@ static void
 ovl_rmdir (fuse_req_t req, fuse_ino_t parent, const char *name)
 {
   cleanup_lock int l = enter_big_lock ();
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
-      return;
-  }
 
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_rmdir(parent=%" PRIu64 ", name=%s)\n",
 	     parent, name);
+
+  if (!checkAuthority(req, parent)) {
+    fuse_reply_err (req, ENOENT);
+    return;
+  }
+
   do_rm (req, parent, name, true);
 }
 
@@ -3674,8 +4754,8 @@ ovl_setxattr (fuse_req_t req, fuse_ino_t ino, const char *name,
     fprintf (stderr, "ovl_setxattr(ino=%" PRIu64 ", name=%s, value=%s, size=%zu, flags=%d)\n", ino, name,
              value, size, flags);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (!checkAuthority(req, ino)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
 
@@ -3698,7 +4778,7 @@ ovl_setxattr (fuse_req_t req, fuse_ino_t ino, const char *name,
       return;
     }
 
-  node = get_node_up (lo, node);
+  node = get_node_up (req, lo, node);
   if (node == NULL)
     {
       fuse_reply_err (req, errno);
@@ -3751,8 +4831,8 @@ ovl_removexattr (fuse_req_t req, fuse_ino_t ino, const char *name)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_removexattr(ino=%" PRIu64 ", name=%s)\n", ino, name);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (!checkAuthority(req, ino)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
 
@@ -3763,7 +4843,7 @@ ovl_removexattr (fuse_req_t req, fuse_ino_t ino, const char *name)
       return;
     }
 
-  node = get_node_up (lo, node);
+  node = get_node_up (req, lo, node);
   if (node == NULL)
     {
       fuse_reply_err (req, errno);
@@ -3905,7 +4985,7 @@ ovl_do_open (fuse_req_t req, fuse_ino_t parent, const char *name, int flags, mod
           return -1;
         }
 
-      p = get_node_up (lo, p);
+      p = get_node_up (req, lo, p);
       if (p == NULL)
         return -1;
 
@@ -3968,7 +5048,7 @@ ovl_do_open (fuse_req_t req, fuse_ino_t parent, const char *name, int flags, mod
     {
       struct ovl_layer *l;
 
-      n = get_node_up (lo, n);
+      n = get_node_up (req, lo, n);
       if (n == NULL)
         return -1;
 
@@ -3981,59 +5061,171 @@ ovl_do_open (fuse_req_t req, fuse_ino_t parent, const char *name, int flags, mod
     }
 }
 
-static void
-ovl_read (fuse_req_t req, fuse_ino_t ino, size_t size,
+static void ovl_read (fuse_req_t req, fuse_ino_t ino, size_t size,
 	 off_t offset, struct fuse_file_info *fi)
 {
-  struct fuse_bufvec buf = FUSE_BUFVEC_INIT (size);
-  if (UNLIKELY (ovl_debug (req)))
-    fprintf (stderr, "ovl_read(ino=%" PRIu64 ", size=%zd, "
-	     "off=%lu)\n", ino, size, (unsigned long) offset);
-  buf.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK | FUSE_BUF_FD_RETRY;
-  buf.buf[0].fd = fi->fh;
-  buf.buf[0].pos = offset;
-  fuse_reply_data (req, &buf, 0);
+    ssize_t res = 0;
+    uint64_t fh;
+    char* buffer = NULL;
+    struct IORequest blockReq;
+    struct ovl_node *node;
+    struct ovl_data *lo = ovl_data (req);
+
+    node = inode_to_node (lo, ino);
+    if (UNLIKELY (ovl_debug (req)))
+        fprintf (stderr, "ovl_read(ino=%" PRIu64 ", path=%s, size=%zd, off=%lu)\n", ino, node->path, size, (unsigned long) offset);
+
+    if (!checkAuthority(req, ino)) {
+        fuse_reply_err (req, ENOENT);
+        return;
+    }
+
+    //fprintf (stderr, "path=%s name=%s layer=%p last_layer=%p lower=%p upper=%p\n", node->path, node->name, node->layer, node->last_layer, get_lower_layers (lo), get_upper_layer (lo));
+    if (node->layer == get_upper_layer (lo) || node->last_layer == get_upper_layer (lo))
+    {
+        buffer = (char *)malloc(size);
+        memset(buffer, 0 , size);
+        
+        blockReq.fd = fi->fh;
+        blockReq.offset = offset;
+        blockReq.dataLen = size;
+        blockReq.data = buffer;
+        pthread_mutex_lock (&lock);
+        readBlocks(req, node, &blockReq);
+        pthread_mutex_unlock (&lock);
+
+        if (UNLIKELY (ovl_debug (req)))
+        {
+            fprintf (stderr, "ovl_read decode(%d):%s\n", size, buffer);
+        }
+        
+        //reply_buf_limited(req, buffer, size, offset, size);
+        fuse_reply_buf(req, buffer, size);
+    }
+    else
+    {
+        struct fuse_bufvec buf = FUSE_BUFVEC_INIT (size);
+
+        buf.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK | FUSE_BUF_FD_RETRY;
+        buf.buf[0].fd = fi->fh;
+        buf.buf[0].pos = offset;
+
+        fuse_reply_data (req, &buf, 0);
+    }
+
+    free(buffer);
 }
 
-static void
-ovl_write_buf (fuse_req_t req, fuse_ino_t ino,
+static void ovl_write_buf (fuse_req_t req, fuse_ino_t ino,
 	      struct fuse_bufvec *in_buf, off_t off,
 	      struct fuse_file_info *fi)
 {
-  struct ovl_data *lo = ovl_data (req);
-  ssize_t res;
-  struct ovl_ino *inode;
-  int saved_errno;
-  struct fuse_bufvec out_buf = FUSE_BUFVEC_INIT (fuse_buf_size (in_buf));
+    size_t len;
+    size_t total = 0;
+    struct ovl_data *lo = ovl_data (req);
+    ssize_t res;
+    struct ovl_node *node;
+    struct ovl_ino *inode;
+    int saved_errno;
+    struct fuse_buf *buf = NULL;
+    struct IORequest blockReq;
+    struct stat s;
+    int ret = 0;
 
-  out_buf.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK | FUSE_BUF_FD_RETRY;
-  out_buf.buf[0].fd = fi->fh;
-  out_buf.buf[0].pos = off;
+    struct fuse_bufvec out_buf = FUSE_BUFVEC_INIT (fuse_buf_size (in_buf));
 
-  if (UNLIKELY (ovl_debug (req)))
-    fprintf (stderr, "ovl_write_buf(ino=%" PRIu64 ", size=%zd, off=%lu, fd=%d)\n",
-	     ino, out_buf.buf[0].size, (unsigned long) off, (int) fi->fh);
+    out_buf.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK | FUSE_BUF_FD_RETRY;
+    out_buf.buf[0].fd = fi->fh;
+    out_buf.buf[0].pos = off;
 
-  inode = lookup_inode (lo, ino);
-
-  errno = 0;
-  res = fuse_buf_copy (&out_buf, in_buf, 0);
-  saved_errno = errno;
-
-  /* if it is a writepage request, make sure to restore the setuid bit.  */
-  if (fi->writepage && (inode->mode & (S_ISUID|S_ISGID)))
+    node = inode_to_node (lo, ino);
+    if (node == NULL || node->whiteout)
     {
-      if (do_fchmod (lo, fi->fh, inode->mode) < 0)
+        fuse_reply_err (req, ENOENT);
+        return;
+    }
+
+    if (UNLIKELY (ovl_debug (req)))
+    {
+        fprintf (stderr, "ovl_write_buf(ino=%" PRIu64 ", size=%zd, off=%lu, fd=%d, path=%s)\n",
+            ino, out_buf.buf[0].size, (unsigned long) off, (int) fi->fh, node->path);
+    }
+
+    if (!checkAuthority(req, ino)) {
+        fuse_reply_err (req, ENOENT);
+        return;
+    }
+
+    //fprintf (stderr, "path=%s name=%s layer=%p last_layer=%p lower=%p upper=%p\n", node->path, node->name, node->layer, node->last_layer, get_lower_layers (lo), get_upper_layer (lo));
+    if (node->layer == get_upper_layer (lo) || node->last_layer == get_upper_layer (lo))
+    {
+        buf = &in_buf->buf[0];
+        blockReq.fd = node->layer->ds->openat (node->layer, node->path, O_RDWR, node->ino->mode);
+        blockReq.offset = off;
+        blockReq.dataLen = buf->size;
+
+        if(buf->flags & FUSE_BUF_IS_FD)
+        {
+            res = read(buf->fd, buf->mem+in_buf->off, buf->size);
+            if (res < 0) {
+                saved_errno = errno;
+                if (UNLIKELY (ovl_debug (req)))
+                {
+                    fprintf (stderr, "read failed at fd %d offset %d for %d bytes: %s\n", buf->fd, in_buf->off, buf->size, strerror(saved_errno));
+                }
+                fuse_reply_err (req, saved_errno);
+                return;
+            }
+        }
+        blockReq.data = (unsigned char *)buf->mem;
+
+        if (UNLIKELY (ovl_debug (req)))
+        {
+            fprintf (stderr, "ovl_write_buf(%d, %d, %d):", buf->size, in_buf->off, buf->pos);
+            //printhex((unsigned char*)buf->mem, buf->size);
+            fprintf (stderr, "\n");
+        }
+
+        pthread_mutex_lock (&lock);
+        ret = rpl_stat (req, node, -1, NULL, NULL, &s);
+        if (ret)
         {
           fuse_reply_err (req, errno);
           return;
         }
+
+        res = writeBlocks(req, node, s.st_size, &blockReq);
+        saved_errno = errno;
+        pthread_mutex_unlock (&lock);
+        
+        close(blockReq.fd);
+    }
+    else
+    {
+        errno = 0;
+        res = fuse_buf_copy (&out_buf, in_buf, 0);
+        saved_errno = errno;
     }
 
-  if (res < 0)
-    fuse_reply_err (req, saved_errno);
-  else
-    fuse_reply_write (req, (size_t) res);
+    inode = lookup_inode (lo, ino);
+    /* if it is a writepage request, make sure to restore the setuid bit.  */
+    if (fi->writepage && (inode->mode & (S_ISUID|S_ISGID)))
+    {
+        if (do_fchmod (lo, fi->fh, inode->mode) < 0)
+        {
+            fuse_reply_err (req, errno);
+            return;
+        }
+    }
+
+    fprintf (stderr, "ovl_write_buf(res=%d)", res);
+    if (res < 0)
+    {
+        fprintf (stderr, "ovl_write_buf(res=%d, saved_errno=%d)", res, saved_errno);
+        fuse_reply_err (req, saved_errno);
+    }
+    else
+        fuse_reply_write (req, (size_t) res);
 }
 
 static void
@@ -4044,6 +5236,11 @@ ovl_release (fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_release(ino=%" PRIu64 ")\n", ino);
+
+  if (!checkAuthority(req, ino)) {
+      fuse_reply_err (req, ENOENT);
+      return;
+  }
 
   ret = close (fi->fh);
   fuse_reply_err (req, ret == 0 ? 0 : errno);
@@ -4120,15 +5317,17 @@ ovl_create (fuse_req_t req, fuse_ino_t parent, const char *name,
     fprintf (stderr, "ovl_create(parent=%" PRIu64 ", name=%s)\n",
 	     parent, name);
 
+  if (!checkAuthority(req, parent)) {
+      fuse_reply_err (req, ENOENT);
+      return;
+  }
+
   if (strlen (name) > get_fs_namemax (lo))
     {
       fuse_reply_err (req, ENAMETOOLONG);
       return;
     }
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
-      return;
-  }
+
   fi->flags = fi->flags | O_CREAT;
 
   if (lo->xattr_permissions)
@@ -4165,13 +5364,24 @@ ovl_open (fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
   struct ovl_data *lo = ovl_data (req);
   cleanup_lock int l = enter_big_lock ();
   cleanup_close int fd = -1;
+  int flags = 0;
+  struct ovl_node *node;
 
+  if(fi->flags&O_WRONLY)
+  {
+    //readOneBlock need the O_RDWR to pread
+    flags = fi->flags&(~O_WRONLY)&(~O_APPEND)|O_RDWR;
+  }
+
+  node = inode_to_node (lo, ino);
   if (UNLIKELY (ovl_debug (req)))
-    fprintf (stderr, "ovl_open(ino=%" PRIu64 ")\n", ino);
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+    fprintf (stderr, "ovl_open(ino=%" PRIu64 ", path=%s, flags=%d)\n", ino, node->path, fi->flags);
+
+  if (!checkAuthority(req, ino)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
+
   fd = ovl_do_open (req, ino, NULL, fi->flags, 0700, NULL, NULL);
   if (fd < 0)
     {
@@ -4193,25 +5403,29 @@ ovl_getattr (fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
   struct ovl_node *node;
   struct fuse_entry_param e;
 
-  if (UNLIKELY (ovl_debug (req)))
-    fprintf (stderr, "ovl_getattr(ino=%" PRIu64 ")\n", ino);
-
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
-      return;
-  }
   node = do_lookup_file (req, lo, ino, NULL);
-  if (node == NULL || node->whiteout)
-    {
+  if (UNLIKELY (ovl_debug (req)))
+  {
+    fprintf (stderr, "ovl_getattr(ino=%" PRIu64 ", path=%s)\n", ino, node->path);
+  }
+  syslog(LOG_INFO, "ovl_getattr(ino=%" PRIu64 ", path=%s)\n", ino, node->path);
+
+  if (!checkAuthority(req, ino)) {
       fuse_reply_err (req, ENOENT);
       return;
-    }
+  }
+  
+  if (node == NULL || node->whiteout)
+  {
+    fuse_reply_err (req, ENOENT);
+    return;
+  }
 
   if (do_getattr (req, &e, node, -1, NULL) < 0)
-    {
-      fuse_reply_err (req, errno);
-      return;
-    }
+  {
+    fuse_reply_err (req, errno);
+    return;
+  }
 
   fuse_reply_attr (req, &e.attr, get_timeout (lo));
 }
@@ -4233,11 +5447,12 @@ ovl_setattr (fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to_set, stru
 
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_setattr(ino=%" PRIu64 ", to_set=%d)\n", ino, to_set);
-  
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
-      return;
+
+  if (!checkAuthority(req, ino)) {
+    fuse_reply_err (req, ENOENT);
+    return;
   }
+
   node = do_lookup_file (req, lo, ino, NULL);
   if (node == NULL || node->whiteout)
     {
@@ -4245,7 +5460,7 @@ ovl_setattr (fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to_set, stru
       return;
     }
 
-  node = get_node_up (lo, node);
+  node = get_node_up (req, lo, node);
   if (node == NULL)
     {
       fuse_reply_err (req, errno);
@@ -4424,9 +5639,9 @@ ovl_link (fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent, const char *newn
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_link(ino=%" PRIu64 ", newparent=%" PRIu64 ", newname=%s)\n", ino, newparent, newname);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
-      return;
+  if (!checkAuthority(req, ino)) {
+    fuse_reply_err (req, ENOENT);
+    return;
   }
 
   if (strlen (newname) > get_fs_namemax (lo))
@@ -4442,7 +5657,7 @@ ovl_link (fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent, const char *newn
       return;
     }
 
-  node = get_node_up (lo, node);
+  node = get_node_up (req, lo, node);
   if (node == NULL)
     {
       fuse_reply_err (req, errno);
@@ -4463,7 +5678,7 @@ ovl_link (fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent, const char *newn
       return;
     }
 
-  newparentnode = get_node_up (lo, newparentnode);
+  newparentnode = get_node_up (req, lo, newparentnode);
   if (newparentnode == NULL)
     {
       fuse_reply_err (req, errno);
@@ -4573,10 +5788,10 @@ ovl_symlink (fuse_req_t req, const char *link, fuse_ino_t parent, const char *na
 
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_symlink(link=%s, ino=%" PRIu64 ", name=%s)\n", link, parent, name);
-  
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
-      return;
+
+  if (!checkAuthority(req, parent)) {
+    fuse_reply_err (req, ENOENT);
+    return;
   }
 
   if (strlen (name) > get_fs_namemax (lo))
@@ -4592,7 +5807,7 @@ ovl_symlink (fuse_req_t req, const char *link, fuse_ino_t parent, const char *na
       return;
     }
 
-  pnode = get_node_up (lo, pnode);
+  pnode = get_node_up (req, lo, pnode);
   if (pnode == NULL)
     {
       fuse_reply_err (req, errno);
@@ -4700,7 +5915,7 @@ ovl_rename_exchange (fuse_req_t req, fuse_ino_t parent, const char *name,
   destpnode = do_lookup_file (req, lo, newparent, NULL);
   destnode = NULL;
 
-  pnode = get_node_up (lo, pnode);
+  pnode = get_node_up (req, lo, pnode);
   if (pnode == NULL)
     goto error;
 
@@ -4709,7 +5924,7 @@ ovl_rename_exchange (fuse_req_t req, fuse_ino_t parent, const char *name,
     goto error;
   srcfd = ret;
 
-  destpnode = get_node_up (lo, destpnode);
+  destpnode = get_node_up (req, lo, destpnode);
   if (destpnode == NULL)
     goto error;
 
@@ -4720,7 +5935,7 @@ ovl_rename_exchange (fuse_req_t req, fuse_ino_t parent, const char *name,
 
   destnode = do_lookup_file (req, lo, newparent, newname);
 
-  node = get_node_up (lo, node);
+  node = get_node_up (req, lo, node);
   if (node == NULL)
     goto error;
 
@@ -4734,7 +5949,7 @@ ovl_rename_exchange (fuse_req_t req, fuse_ino_t parent, const char *name,
       fuse_reply_err (req, EXDEV);
       return;
     }
-  destnode = get_node_up (lo, destnode);
+  destnode = get_node_up (req, lo, destnode);
   if (destnode == NULL)
     goto error;
 
@@ -4824,7 +6039,7 @@ ovl_rename_direct (fuse_req_t req, fuse_ino_t parent, const char *name,
   destpnode = do_lookup_file (req, lo, newparent, NULL);
   destnode = NULL;
 
-  pnode = get_node_up (lo, pnode);
+  pnode = get_node_up (req, lo, pnode);
   if (pnode == NULL)
     goto error;
 
@@ -4833,7 +6048,7 @@ ovl_rename_direct (fuse_req_t req, fuse_ino_t parent, const char *name,
     goto error;
   srcfd = ret;
 
-  destpnode = get_node_up (lo, destpnode);
+  destpnode = get_node_up (req, lo, destpnode);
   if (destpnode == NULL)
     goto error;
 
@@ -4845,7 +6060,7 @@ ovl_rename_direct (fuse_req_t req, fuse_ino_t parent, const char *name,
   node_set_name (&key, (char *) newname);
   destnode = hash_lookup (destpnode->children, &key);
 
-  node = get_node_up (lo, node);
+  node = get_node_up (req, lo, node);
   if (node == NULL)
     goto error;
 
@@ -4895,7 +6110,7 @@ ovl_rename_direct (fuse_req_t req, fuse_ino_t parent, const char *name,
           /* If the node is still accessible then be sure we
              can write to it.  Fix it to be done when a write is
              really done, not now.  */
-          destnode = get_node_up (lo, destnode);
+          destnode = get_node_up (req, lo, destnode);
           if (destnode == NULL)
             {
               fuse_reply_err (req, errno);
@@ -4998,16 +6213,16 @@ ovl_rename (fuse_req_t req, fuse_ino_t parent, const char *name,
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_rename(ino=%" PRIu64 ", name=%s , ino=%" PRIu64 ", name=%s)\n", parent, name, newparent, newname);
 
+  if (!checkAuthority(req, parent)) {
+    fuse_reply_err (req, ENOENT);
+    return;
+  }
+
   if (strlen (newname) > get_fs_namemax (lo))
     {
       fuse_reply_err (req, ENAMETOOLONG);
       return;
     }
-
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
-      return;
-  }
 
   if (flags & RENAME_EXCHANGE)
     ovl_rename_exchange (req, parent, name, newparent, newname, flags);
@@ -5030,10 +6245,11 @@ ovl_statfs (fuse_req_t req, fuse_ino_t ino)
   struct statvfs sfs;
   struct ovl_data *lo = ovl_data (req);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (!checkAuthority(req, ino)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
+
   ret = do_statfs (lo, &sfs);
   if (ret < 0)
     {
@@ -5057,8 +6273,8 @@ ovl_readlink (fuse_req_t req, fuse_ino_t ino)
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_readlink(ino=%" PRIu64 ")\n", ino);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
+  if (!checkAuthority(req, ino)) {
+      fuse_reply_err (req, ENOENT);
       return;
   }
 
@@ -5157,9 +6373,9 @@ ovl_mknod (fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode, dev
     fprintf (stderr, "ovl_mknod(ino=%" PRIu64 ", name=%s, mode=%d, rdev=%lu)\n",
 	     parent, name, mode, rdev);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
-      return;
+  if (!checkAuthority(req, parent)) {
+    fuse_reply_err (req, ENOENT);
+    return;
   }
 
   if (strlen (name) > get_fs_namemax (lo))
@@ -5187,7 +6403,7 @@ ovl_mknod (fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode, dev
       return;
     }
 
-  pnode = get_node_up (lo, pnode);
+  pnode = get_node_up (req, lo, pnode);
   if (pnode == NULL)
     {
       fuse_reply_err (req, errno);
@@ -5285,9 +6501,9 @@ ovl_mkdir (fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode)
     fprintf (stderr, "ovl_mkdir(ino=%" PRIu64 ", name=%s, mode=%d)\n",
 	     parent, name, mode);
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
-      return;
+  if (!checkAuthority(req, parent)) {
+    fuse_reply_err (req, ENOENT);
+    return;
   }
 
   if (strlen (name) > get_fs_namemax (lo))
@@ -5312,7 +6528,7 @@ ovl_mkdir (fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode)
       return;
     }
 
-  pnode = get_node_up (lo, pnode);
+  pnode = get_node_up (req, lo, pnode);
   if (pnode == NULL)
     {
       fuse_reply_err (req, errno);
@@ -5463,14 +6679,14 @@ do_fsync (fuse_req_t req, fuse_ino_t ino, int datasync, int fd)
 static void
 ovl_fsync (fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *fi)
 {
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
-      return;
-  }
-
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_fsync(ino=%" PRIu64 ", datasync=%d, fi=%p)\n",
              ino, datasync, fi);
+
+  if (!checkAuthority(req, ino)) {
+    fuse_reply_err (req, ENOENT);
+    return;
+  }
 
   return do_fsync (req, ino, datasync, fi->fh);
 }
@@ -5478,14 +6694,14 @@ ovl_fsync (fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *
 static void
 ovl_fsyncdir (fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *fi)
 {
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
-      return;
-  }
-
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_fsyncdir(ino=%" PRIu64 ", datasync=%d, fi=%p)\n",
              ino, datasync, fi);
+
+  if (!checkAuthority(req, ino)) {
+    fuse_reply_err (req, ENOENT);
+    return;
+  }
 
   return do_fsync (req, ino, datasync, -1);
 }
@@ -5514,14 +6730,14 @@ ovl_ioctl (fuse_req_t req, fuse_ino_t ino, int cmd, void *arg,
       return;
     }
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
-      return;
-    }
-
   if (UNLIKELY (ovl_debug (req)))
     fprintf (stderr, "ovl_ioctl(ino=%" PRIu64 ", cmd=%d, arg=%p, fi=%p, flags=%d, buf=%p, in_bufsz=%zu, out_bufsz=%zu)\n",
              ino, cmd, arg, fi, flags, in_buf, in_bufsz, out_bufsz);
+
+  if (!checkAuthority(req, ino)) {
+    fuse_reply_err (req, ENOENT);
+    return;
+  }
 
   node = do_lookup_file (req, lo, ino, NULL);
   if (node == NULL || node->whiteout)
@@ -5540,7 +6756,7 @@ ovl_ioctl (fuse_req_t req, fuse_ino_t ino, int cmd, void *arg,
 
     case FS_IOC_SETVERSION:
     case FS_IOC_SETFLAGS:
-      node = get_node_up (lo, node);
+      node = get_node_up (req, lo, node);
       if (node == NULL)
         {
           fuse_reply_err (req, errno);
@@ -5593,6 +6809,11 @@ ovl_fallocate (fuse_req_t req, fuse_ino_t ino, int mode, off_t offset, off_t len
     fprintf (stderr, "ovl_fallocate(ino=%" PRIu64 ", mode=%d, offset=%lo, length=%lu, fi=%p)\n",
              ino, mode, offset, length, fi);
 
+  if (!checkAuthority(req, ino)) {
+    fuse_reply_err (req, ENOENT);
+    return;
+  }
+
   node = do_lookup_file (req, lo, ino, NULL);
   if (node == NULL || node->whiteout)
     {
@@ -5600,12 +6821,7 @@ ovl_fallocate (fuse_req_t req, fuse_ino_t ino, int mode, off_t offset, off_t len
       return;
     }
 
-  if (0 == checkSandbox(req->ctx.pid)) {
-      fuse_reply_err (req, 1);
-      return;
-    }
-
-  node = get_node_up (lo, node);
+  node = get_node_up (req, lo, node);
   if (node == NULL)
     {
       fuse_reply_err (req, errno);
@@ -5650,6 +6866,11 @@ ovl_copy_file_range (fuse_req_t req, fuse_ino_t ino_in, off_t off_in, struct fus
     fprintf (stderr, "ovl_copy_file_range(ino_in=%" PRIu64 ", off_in=%lo, fi_in=%p, ino_out=%" PRIu64 ", off_out=%lo, fi_out=%p, size=%zu, flags=%d)\n",
              ino_in, off_in, fi_in, ino_out, off_out, fi_out, len, flags);
 
+  if (!checkAuthority(req, ino_in)) {
+    fuse_reply_err (req, ENOENT);
+    return;
+  }
+
   node = do_lookup_file (req, lo, ino_in, NULL);
   if (node == NULL || node->whiteout)
     {
@@ -5664,7 +6885,7 @@ ovl_copy_file_range (fuse_req_t req, fuse_ino_t ino_in, off_t off_in, struct fus
       return;
     }
 
-  dnode = get_node_up (lo, dnode);
+  dnode = get_node_up (req, lo, dnode);
   if (dnode == NULL)
     {
       fuse_reply_err (req, errno);
@@ -5882,9 +7103,88 @@ load_default_plugins ()
   return plugins;
 }
 
-int
-main (int argc, char *argv[])
+void newAESCipher(   int keyLen)
 {
+    const EVP_CIPHER *blockCipher = NULL;
+    const EVP_CIPHER *streamCipher = NULL;
+
+    if (keyLen <= 0) {
+      keyLen = 192;
+    }
+    
+    //keyLen = AESKeyRange.closest(keyLen);
+    
+    switch (keyLen) {
+      case 128:
+        blockCipher = EVP_aes_128_cbc();
+        streamCipher = EVP_aes_128_cfb();
+        break;
+    
+      case 192:
+        blockCipher = EVP_aes_192_cbc();
+        streamCipher = EVP_aes_192_cfb();
+        break;
+    
+      case 256:
+      default:
+        blockCipher = EVP_aes_256_cbc();
+        streamCipher = EVP_aes_256_cfb();
+        break;
+    }
+
+    gSSLCipher.blockCipher = blockCipher;
+    gSSLCipher.streamCipher = streamCipher;
+    gSSLCipher.keySize = keyLen / 8;
+    gSSLCipher.ivLength = EVP_CIPHER_iv_length(blockCipher);
+}
+
+void newKey(const char *password, int passwdLength, int keySize, int ivLength) {
+    gSSLKey.keySize = keySize;
+    gSSLKey.ivLength = ivLength;
+    
+    gSSLKey.buffer = (unsigned char *)OPENSSL_malloc(gSSLKey.keySize + gSSLKey.ivLength);
+    memset(gSSLKey.buffer, 0, (size_t)gSSLKey.keySize + (size_t)gSSLKey.ivLength);
+
+    // most likely fails unless we're running as root, or a user-page-lock
+    // kernel patch is applied..
+    //mlock(buffer, (size_t)gSSLKey.keySize + (size_t)gSSLKey.ivLength);
+
+    /*
+    gSSLKey.block_enc = EVP_CIPHER_CTX_new();
+    EVP_CIPHER_CTX_init(gSSLKey.block_enc);
+    gSSLKey.block_dec = EVP_CIPHER_CTX_new();
+    EVP_CIPHER_CTX_init(gSSLKey.block_dec);
+    gSSLKey.stream_enc = EVP_CIPHER_CTX_new();
+    EVP_CIPHER_CTX_init(gSSLKey.stream_enc);
+    gSSLKey.stream_dec = EVP_CIPHER_CTX_new();
+    EVP_CIPHER_CTX_init(gSSLKey.stream_dec);
+    %*/
+    
+    gSSLKey.mac_ctx = (HMAC_CTX *)OPENSSL_malloc(sizeof(HMAC_CTX));
+    if (gSSLKey.mac_ctx != NULL) {
+        memset(gSSLKey.mac_ctx, 0, sizeof(HMAC_CTX));
+        HMAC_CTX_cleanup(gSSLKey.mac_ctx);
+    }
+
+    EVP_BytesToKey(gSSLCipher.blockCipher, EVP_sha1(), NULL, password, passwdLength, 16, gSSLKey.buffer, gSSLKey.buffer+gSSLKey.keySize);
+
+    HMAC_Init_ex(gSSLKey.mac_ctx, gSSLKey.buffer, keySize, EVP_sha1(), NULL);
+}
+
+bool init_ovl_pidinfo()
+{
+    gOvlPid = getpid();
+    gManagePid = getppid();
+
+    if (gOvlPid < 0 || gManagePid < 0)
+        return false;
+
+    return true;
+}
+
+int main (int argc, char *argv[])
+{
+  unsigned char password[] = "darkforest";
   struct fuse_session *se;
   struct fuse_cmdline_opts opts;
   char **newargv = get_new_args (&argc, argv);
@@ -5916,6 +7216,9 @@ main (int argc, char *argv[])
   struct ovl_layer *tmp_layer = NULL;
   struct fuse_args args = FUSE_ARGS_INIT (argc, newargv);
 
+  newAESCipher(gKeyLen);
+  newKey(password, strlen(password), gSSLCipher.keySize, gSSLCipher.ivLength);
+  
   memset (&opts, 0, sizeof (opts));
   if (fuse_opt_parse (&args, &lo, ovl_opts, fuse_opt_proc) == -1)
     error (EXIT_FAILURE, 0, "error parsing options");
@@ -5943,6 +7246,11 @@ main (int argc, char *argv[])
       fuse_lowlevel_version ();
       exit (EXIT_SUCCESS);
     }
+
+  if(!init_ovl_pidinfo())
+  {
+    error (EXIT_FAILURE, 0, "get fuse-overlayfs pid fail");
+  }
 
   lo.uid = geteuid ();
   lo.gid = getegid ();
@@ -6147,6 +7455,12 @@ err_out1:
   close (lo.workdir_fd);
 
   fuse_opt_free_args (&args);
+
+  OPENSSL_free(gSSLKey.buffer);
+  if (gSSLKey.mac_ctx != NULL) {
+    HMAC_CTX_cleanup(gSSLKey.mac_ctx);
+    OPENSSL_free(gSSLKey.mac_ctx);
+  }
 
   exit (ret ? EXIT_FAILURE : EXIT_SUCCESS);
   return 1;

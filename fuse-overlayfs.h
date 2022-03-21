@@ -23,8 +23,39 @@
 # include <plugin-manager.h>
 # include <stdbool.h>
 # include <sys/types.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/buffer.h>
 
 typedef struct hash_table Hash_table;
+
+struct SSLCipher
+{
+    const EVP_CIPHER *blockCipher;
+    const EVP_CIPHER *streamCipher;
+    unsigned int keySize;  // in bytes
+    unsigned int ivLength;
+};
+
+struct SSLKey
+{
+    unsigned int keySize;  // in bytes
+    unsigned int ivLength;
+    // key data is first _keySize bytes,
+    // followed by iv of _ivLength bytes,
+    unsigned char *buffer;
+    
+    HMAC_CTX *mac_ctx;
+};
+
+struct IORequest {
+  int fd;
+  off_t offset;
+
+  // amount of bytes to read/write.
+  size_t dataLen;
+  unsigned char *data;
+};
 
 struct ovl_ino
 {
@@ -50,6 +81,14 @@ struct ovl_node
   Hash_table *inodes;
   struct ovl_ino *ino;
   struct ovl_node *next_link;
+  
+  pthread_mutex_t mutex;
+  EVP_CIPHER_CTX *block_enc;
+  EVP_CIPHER_CTX *block_dec;
+  EVP_CIPHER_CTX *stream_enc;
+  EVP_CIPHER_CTX *stream_dec;
+  struct IORequest cache;
+
   unsigned int in_readdir;
 
   unsigned int do_unlink : 1;
