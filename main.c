@@ -3673,14 +3673,14 @@ ssize_t readOneBlock(fuse_req_t req, struct ovl_node *node, const struct IOReque
     int eno = errno;
     if (UNLIKELY (ovl_debug (req)))
     {
-      fprintf (stderr, "read failed at fd %d offset %d for %d bytes: %s\n", blockReq->fd, blockReq->offset, blockReq->dataLen, strerror(eno));
+      fprintf (stderr, "read failed at fd %d offset %ld for %ld bytes: %s\n", blockReq->fd, blockReq->offset, blockReq->dataLen, strerror(eno));
     }
     readSize = -eno;
   }
 
   if (UNLIKELY (ovl_debug (req)))
   {
-    fprintf (stderr, "readOneBlock raw(%d)", readSize);
+    fprintf (stderr, "readOneBlock raw(%ld)", readSize);
     //printhex((unsigned char*)blockReq->data, readSize);
     fprintf (stderr, "\n");
   }
@@ -3713,7 +3713,7 @@ ssize_t readOneBlock(fuse_req_t req, struct ovl_node *node, const struct IOReque
     if (!ok) {
       if (UNLIKELY (ovl_debug (req)))
       {
-        fprintf (stderr, "decodeBlock failed for block %d, size %d\n", blockNum, readSize);
+        fprintf (stderr, "decodeBlock failed for block %ld, size %ld\n", blockNum, readSize);
       }
       readSize = -EBADMSG;
     }
@@ -3722,13 +3722,13 @@ ssize_t readOneBlock(fuse_req_t req, struct ovl_node *node, const struct IOReque
   {
     if (UNLIKELY (ovl_debug (req)))
     {
-      fprintf (stderr, "readSize zero for offset %d\n", blockReq->offset);
+      fprintf (stderr, "readSize zero for offset %ld\n", blockReq->offset);
     }
   }
 
   if (UNLIKELY (ovl_debug (req)))
   {
-    fprintf (stderr, "readOneBlock decode ok=%d(%d)", ok, readSize);
+    fprintf (stderr, "readOneBlock decode ok=%d(%ld)", ok, readSize);
     //printhex((unsigned char*)blockReq->data, readSize);
     fprintf (stderr, "\n");
   }
@@ -3755,7 +3755,7 @@ ssize_t writeOneBlock(fuse_req_t req, struct ovl_node *node, const struct IORequ
     
     if (UNLIKELY (ovl_debug (req)))
     {
-        fprintf (stderr, "writeOneBlock encode ok=%d(%d):", ok, blockReq->dataLen);
+        fprintf (stderr, "writeOneBlock encode ok=%d(%ld):", ok, blockReq->dataLen);
         //printhex((unsigned char*)blockReq->data, blockReq->dataLen);
         fprintf (stderr, "\n");
     }
@@ -3765,7 +3765,7 @@ ssize_t writeOneBlock(fuse_req_t req, struct ovl_node *node, const struct IORequ
         while (bytes != 0) {
             if (UNLIKELY (ovl_debug (req)))
             {
-                fprintf (stderr, "pwrite at offset %d for %d bytes:%X\n", offset, bytes, *blockReq->data);
+                fprintf (stderr, "pwrite at offset %ld for %ld bytes:%X\n", offset, bytes, *blockReq->data);
             }
             ssize_t writeSize = pwrite(blockReq->fd, buf, bytes, offset);
 
@@ -3773,7 +3773,7 @@ ssize_t writeOneBlock(fuse_req_t req, struct ovl_node *node, const struct IORequ
                 int eno = errno;
                 if (UNLIKELY (ovl_debug (req)))
                 {
-                    fprintf (stderr, "pwrite failed at offset %d for %d bytes: %s\n", offset, bytes, strerror(eno));
+                    fprintf (stderr, "pwrite failed at offset %ld for %ld bytes: %s\n", offset, bytes, strerror(eno));
                 }
                 // pwrite is not expected to return 0, so eno should always be set, but we never know...
                 return -eno;
@@ -3790,7 +3790,7 @@ ssize_t writeOneBlock(fuse_req_t req, struct ovl_node *node, const struct IORequ
     } else {
         if (UNLIKELY (ovl_debug (req)))
         {
-            fprintf (stderr, "encodeBlock failed for block %d, size %d\n", blockNum, blockReq->dataLen);
+            fprintf (stderr, "encodeBlock failed for block %ld, size %ld\n", blockNum, blockReq->dataLen);
         }
         res = -EBADMSG;
     }
@@ -3821,7 +3821,7 @@ ssize_t cacheReadOneBlock(fuse_req_t req, struct ovl_node *node, const struct IO
     // satisfy request from cache
     if (UNLIKELY (ovl_debug (req)))
     {
-      fprintf(stderr, "Read from cache offset=%d, dataLen=%d\n", node->cache.offset, node->cache.dataLen);
+      fprintf(stderr, "Read from cache offset=%ld, dataLen=%ld\n", node->cache.offset, node->cache.dataLen);
     }
     size_t len = blockReq->dataLen;
     if (node->cache.dataLen < len) {
@@ -3852,7 +3852,7 @@ ssize_t cacheReadOneBlock(fuse_req_t req, struct ovl_node *node, const struct IO
     memcpy(blockReq->data, node->cache.data, result);
     if (UNLIKELY (ovl_debug (req)))
     {
-      fprintf(stderr, "cacheReadOneBlock save cache: offset=%d, dataLen=%d data=%s\n", blockReq->offset, blockReq->dataLen, blockReq->data);
+      fprintf(stderr, "cacheReadOneBlock save cache: offset=%ld, dataLen=%ld data=%s\n", blockReq->offset, blockReq->dataLen, blockReq->data);
     }
   }
   return result;
@@ -3879,7 +3879,7 @@ ssize_t cacheWriteOneBlock(fuse_req_t req, struct ovl_node *node, const struct I
     node->cache.dataLen = blockReq->dataLen;
     if (UNLIKELY (ovl_debug (req)))
     {
-      fprintf(stderr, "cacheWriteOneBlock save cache: offset=%d, dataLen=%d\n", blockReq->offset, blockReq->dataLen);
+      fprintf(stderr, "cacheWriteOneBlock save cache: offset=%ld, dataLen=%ld\n", blockReq->offset, blockReq->dataLen);
     }
   }
   return res;
@@ -3911,7 +3911,7 @@ ssize_t readBlocks(fuse_req_t req, struct ovl_node *node, const struct IORequest
         tmp.offset = blockNum * gBlockSize;
         if (UNLIKELY (ovl_debug (req)))
         {
-            fprintf(stderr, "readBlocks: offset=%d, dataLen=%d\n", tmp.offset, tmp.dataLen);
+            fprintf(stderr, "readBlocks: offset=%ld, dataLen=%ld\n", tmp.offset, tmp.dataLen);
         }
         
         // if we're reading a full block, then read directly into the
@@ -4000,7 +4000,7 @@ int padFile(fuse_req_t req, struct ovl_node *node, int fd, off_t oldSize, off_t 
     if (blockReq.dataLen != 0) {
       if (UNLIKELY (ovl_debug (req)))
       {
-        fprintf (stderr, "padding block %d\n", oldLastBlock);
+        fprintf (stderr, "padding block %ld\n", oldLastBlock);
       }
       memset(data, 0, gBlockSize);
       if ((res = cacheReadOneBlock(req, node, &blockReq)) >= 0) {
@@ -4015,7 +4015,7 @@ int padFile(fuse_req_t req, struct ovl_node *node, int fd, off_t oldSize, off_t 
       for (; (res >= 0) && (oldLastBlock != newLastBlock); ++oldLastBlock) {
         if (UNLIKELY (ovl_debug (req)))
         {
-          fprintf (stderr, "padding block %d\n", oldLastBlock);
+          fprintf (stderr, "padding block %ld\n", oldLastBlock);
         }
         blockReq.offset = oldLastBlock * gBlockSize;
         blockReq.dataLen = gBlockSize;
@@ -4060,7 +4060,7 @@ ssize_t writeBlocks(fuse_req_t req, struct ovl_node *node, off_t fileSize, const
 
   if (UNLIKELY (ovl_debug (req)))
   {
-    fprintf(stderr, "writeBlocks:fd=%d fileSize=%d lastBlockSize=%d\n", blockReq->fd, fileSize, lastBlockSize);
+    fprintf(stderr, "writeBlocks:fd=%d fileSize=%ld lastBlockSize=%ld\n", blockReq->fd, fileSize, lastBlockSize);
   }
 
   off_t lastNonEmptyBlock = lastFileBlock;
@@ -4181,7 +4181,7 @@ ssize_t fileEncode(fuse_req_t req, struct ovl_node *node, int sfd, int dfd, off_
 
     if (UNLIKELY (ovl_debug (req)))
     {
-        fprintf(stderr, "fileEncode:dfd=%d fileSize=%d lastBlockSize=%d\n", dfd, fileSize, lastBlockSize);
+        fprintf(stderr, "fileEncode:dfd=%d fileSize=%ld lastBlockSize=%ld\n", dfd, fileSize, lastBlockSize);
     }
 
     off_t lastNonEmptyBlock = lastFileBlock;
@@ -4210,7 +4210,7 @@ ssize_t fileEncode(fuse_req_t req, struct ovl_node *node, int sfd, int dfd, off_
             int eno = errno;
             if (UNLIKELY (ovl_debug (req)))
             {
-                fprintf (stderr, "read failed at fd %d offset %d for %d bytes: %s\n", sfd, tmp.offset, tmp.dataLen, strerror(eno));
+                fprintf (stderr, "read failed at fd %ld offset %d for %ld bytes: %s\n", sfd, tmp.offset, tmp.dataLen, strerror(eno));
             }
             readSize = -eno;
         }
@@ -5096,7 +5096,7 @@ static void ovl_read (fuse_req_t req, fuse_ino_t ino, size_t size,
 
         if (UNLIKELY (ovl_debug (req)))
         {
-            fprintf (stderr, "ovl_read decode(%d):%s\n", size, buffer);
+            fprintf (stderr, "ovl_read decode(%ld):%s\n", size, buffer);
         }
         
         //reply_buf_limited(req, buffer, size, offset, size);
@@ -5171,7 +5171,7 @@ static void ovl_write_buf (fuse_req_t req, fuse_ino_t ino,
                 saved_errno = errno;
                 if (UNLIKELY (ovl_debug (req)))
                 {
-                    fprintf (stderr, "read failed at fd %d offset %d for %d bytes: %s\n", buf->fd, in_buf->off, buf->size, strerror(saved_errno));
+                    fprintf (stderr, "read failed at fd %d offset %ld for %ld bytes: %s\n", buf->fd, in_buf->off, buf->size, strerror(saved_errno));
                 }
                 fuse_reply_err (req, saved_errno);
                 return;
@@ -5181,7 +5181,7 @@ static void ovl_write_buf (fuse_req_t req, fuse_ino_t ino,
 
         if (UNLIKELY (ovl_debug (req)))
         {
-            fprintf (stderr, "ovl_write_buf(%d, %d, %d):", buf->size, in_buf->off, buf->pos);
+            fprintf (stderr, "ovl_write_buf(%ld, %ld, %ld):", buf->size, in_buf->off, buf->pos);
             //printhex((unsigned char*)buf->mem, buf->size);
             fprintf (stderr, "\n");
         }
@@ -5218,10 +5218,10 @@ static void ovl_write_buf (fuse_req_t req, fuse_ino_t ino,
         }
     }
 
-    fprintf (stderr, "ovl_write_buf(res=%d)", res);
+    fprintf (stderr, "ovl_write_buf(res=%ld)", res);
     if (res < 0)
     {
-        fprintf (stderr, "ovl_write_buf(res=%d, saved_errno=%d)", res, saved_errno);
+        fprintf (stderr, "ovl_write_buf(res=%ld, saved_errno=%d)", res, saved_errno);
         fuse_reply_err (req, saved_errno);
     }
     else
