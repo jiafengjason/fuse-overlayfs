@@ -64,6 +64,7 @@
 #include <utils.h>
 #include <plugin.h>
 #include <syslog.h>
+#include <libgen.h>
 
   // OpenSSL < 1.1.0 or LibreSSL
 #if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
