@@ -1051,6 +1051,7 @@ int isInBox(fuse_req_t req, pid_t accessPid)
     char statPath[MAX_PATH_STR] = {0};
     char buf[MAX_PATH_STR] = {0};
     char procName[MAX_PATH_STR]={0};
+    char accessprocName[MAX_PATH_STR]={0};
     pid_t pid =accessPid;
     pid_t fpid = 0;
     struct stat st;
@@ -1066,14 +1067,20 @@ int isInBox(fuse_req_t req, pid_t accessPid)
         //systemd
         if(pid==1)
         {
-            syslog(LOG_INFO, "systemd:%d\n", accessPid);
+            if (UNLIKELY (ovl_debug (req)))
+	    {
+                syslog(LOG_INFO, "systemd:%d, accessprocName=%s\n", accessPid, accessprocName);
+	    }
             return false;
         }
         //kthreadd
         if(pid==2)
         {
-            syslog(LOG_INFO, "kthreadd:%d\n", accessPid);
-            return false;
+            if (UNLIKELY (ovl_debug (req)))
+	    {
+                syslog(LOG_INFO, "kthreadd:%d, accessprocName=%s\n", accessPid, accessprocName);
+	    }
+            return true;
         }
 
         if(pid==gManagePid)
@@ -1096,12 +1103,55 @@ int isInBox(fuse_req_t req, pid_t accessPid)
         sscanf(buf,"%*d %*c%s %*c %d %*s",procName,&fpid);
         procName[strlen(procName)-1]='\0';
 
+	if (pid == accessPid)
+	{
+     	    strcpy(accessprocName, procName);
+	}
+
         //allow firejail --join
         if(strncmp(procName, "firejail", strlen("firejail"))==0)
         {
             return true;
         }
+
+        if(strncmp(procName, "EnDeskTop", strlen("EnDeskTop"))==0)
+        {
+            return true;
+        }
+
+        if(strncmp(procName, "uebm", strlen("uebm"))==0)
+        {
+            return true;
+        }
+
+        if(strncmp(procName, "StreamTran", strlen("StreamTran"))==0)
+        {
+            return true;
+        }
+
+        if(strncmp(procName, "BgIOThr~Poo", strlen("BgIOThr~Poo"))==0)
+        {
+            return true;
+        }
         
+
+        if(strncmp(procName, "TaskCon~lle", strlen("TaskCon~lle"))==0)
+        {
+            return true;
+
+        }
+
+        if(strncmp(procName, "apport", strlen("apport"))==0)
+        {
+            return true;
+
+        }
+
+        if(strncmp(procName, "Backgro~Poo", strlen("Backgro~Poo"))==0)
+        {
+            return true;
+
+        }
         pid = fpid;
         memset(statPath,0,strlen(statPath));
         memset(buf,0,strlen(buf));
@@ -1127,6 +1177,7 @@ static int checkAuthority(fuse_req_t req, fuse_ino_t ino)
     {
         return true;
     }
+
 
     flag = isInBox(req, req->ctx.pid);
     if(!flag)
@@ -5434,8 +5485,9 @@ ovl_getattr (fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
   if (UNLIKELY (ovl_debug (req)))
   {
     fprintf (stderr, "ovl_getattr(ino=%" PRIu64 ", path=%s)\n", ino, node->path);
+    syslog(LOG_INFO, "ovl_getattr(ino=%" PRIu64 ", path=%s)\n", ino, node->path);
   }
-  syslog(LOG_INFO, "ovl_getattr(ino=%" PRIu64 ", path=%s)\n", ino, node->path);
+
 
   if (!checkAuthority(req, ino)) {
       fuse_reply_err (req, ENOENT);
