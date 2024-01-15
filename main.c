@@ -1145,9 +1145,9 @@ int checkPath(struct ovl_data *lo, char *path)
     char *dname;
 
     dirc = strdup(lo->mountpoint);
-    dname = basename(dirname(dirc));
+    dname = dirname(dirc);
 
-    if (0 == strcmp(path, dname)) {
+    if (0 == strcmp(path, dname+1)) {
         fprintf(stderr, "CheckPath deny, path=%s\n", path);
         //syslog(LOG_INFO, "CheckPath deny, path=%s\n", path);
         return 0;
