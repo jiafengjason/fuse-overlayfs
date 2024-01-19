@@ -2152,11 +2152,11 @@ void removeFirstChar(char *str) {
     }
 }
 
-static int hide_lowlayer_path(char *path, char *name)
+static int hide_lowlayer_path(char *path, char *name, char *home)
 {
     int i = 0;
     int len = 0;
-    char hide_path[256] = {0};
+    char hide_path[1024] = {0};
     char special_paths[][32] = {
         "Desktop",
         "Documents",
@@ -2168,8 +2168,6 @@ static int hide_lowlayer_path(char *path, char *name)
         "Videos"
     };
 
-    char *home = getenv("HOME");
-    removeFirstChar(home);
     if (0 == strncmp(path, home, strlen(home))) {
         if (0 == strncmp(name, ".", strlen("."))) {
             return 0;
@@ -2179,12 +2177,14 @@ static int hide_lowlayer_path(char *path, char *name)
                 return 0;
             }
         }
+        syslog(LOG_INFO, "hide_lowlayer_path path=%s name=%s\n", path, name);
         return 1;
     }
 
     for (i = 0; i<sizeof(special_paths)/32; i++) {
-        sprintf(hide_path, "%s/%s", home, special_paths[i]);
+        snprintf(hide_path, sizeof(hide_path), "%s/%s", home, special_paths[i]);
         if (0 == strncmp(path, hide_path, strlen(hide_path))) {
+            syslog(LOG_INFO, "hide_lowlayer_path path=%s name=%s\n", path, name);
             return 1;
         }
         memset(hide_path, 0, sizeof(hide_path));
@@ -2200,8 +2200,9 @@ load_dir (struct ovl_data *lo, struct ovl_node *n, struct ovl_layer *layer, char
   bool stop_lookup = false;
   struct ovl_layer *it, *lower_layer = get_lower_layers(lo), *upper_layer = get_upper_layer (lo);
   char parent_whiteout_path[PATH_MAX];
-  char *home = getenv("HOME");
-  removeFirstChar(home);
+  char *home = getenv("BOX_HOME");
+
+  syslog(LOG_INFO, "home=%s\n", home+1);
 
   if (!n)
     {
@@ -2265,7 +2266,7 @@ load_dir (struct ovl_data *lo, struct ovl_node *n, struct ovl_layer *layer, char
           if ((strcmp (dent->d_name, ".") == 0) || strcmp (dent->d_name, "..") == 0)
             continue;
 
-          if (it == lower_layer && hide_lowlayer_path(path, dent->d_name))
+          if (it == lower_layer && hide_lowlayer_path(path, dent->d_name, home+1))
           {
               continue;
           }
