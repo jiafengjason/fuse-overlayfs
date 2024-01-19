@@ -2146,13 +2146,62 @@ get_whiteout_name (const char *name, struct stat *st)
   return NULL;
 }
 
+void removeFirstChar(char *str) {
+    if (str != NULL && str[0] != '\0') {
+        memmove(str, str + 1, strlen(str + 1) + 1);
+    }
+}
+
+static int hide_lowlayer_path(char *path, char *name)
+{
+    int i = 0;
+    int len = 0;
+    char hide_path[256] = {0};
+    char special_paths[][32] = {
+        "Desktop",
+        "Documents",
+        "Downloads",
+        "Music",
+        "Pictures",
+        "Public",
+        "Templates",
+        "Videos"
+    };
+
+    char *home = getenv("HOME");
+    removeFirstChar(home);
+    if (0 == strncmp(path, home, strlen(home))) {
+        if (0 == strncmp(name, ".", strlen("."))) {
+            return 0;
+        }
+        for (i = 0; i<sizeof(special_paths)/32; i++) {
+            if (0 == strncmp(name, special_paths[i], strlen(special_paths[i]))) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+
+    for (i = 0; i<sizeof(special_paths)/32; i++) {
+        sprintf(hide_path, "%s/%s", home, special_paths[i]);
+        if (0 == strncmp(path, hide_path, strlen(hide_path))) {
+            return 1;
+        }
+        memset(hide_path, 0, sizeof(hide_path));
+    }
+
+    return 0;
+}
+
 static struct ovl_node *
 load_dir (struct ovl_data *lo, struct ovl_node *n, struct ovl_layer *layer, char *path, char *name)
 {
   struct dirent *dent;
   bool stop_lookup = false;
-  struct ovl_layer *it, *upper_layer = get_upper_layer (lo);
+  struct ovl_layer *it, *lower_layer = get_lower_layers(lo), *upper_layer = get_upper_layer (lo);
   char parent_whiteout_path[PATH_MAX];
+  char *home = getenv("HOME");
+  removeFirstChar(home);
 
   if (!n)
     {
@@ -2213,11 +2262,15 @@ load_dir (struct ovl_data *lo, struct ovl_node *n, struct ovl_layer *layer, char
               break;
             }
 
-          node_set_name (&key, dent->d_name);
-
           if ((strcmp (dent->d_name, ".") == 0) || strcmp (dent->d_name, "..") == 0)
             continue;
 
+          if (it == lower_layer && hide_lowlayer_path(path, dent->d_name))
+          {
+              continue;
+          }
+
+          node_set_name (&key, dent->d_name);
           child = hash_lookup (n->children, &key);
           if (child)
             {
