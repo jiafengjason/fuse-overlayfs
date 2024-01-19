@@ -39,6 +39,7 @@
 #include <errno.h>
 #include <err.h>
 #include <sys/ioctl.h>
+#include <pwd.h>
 #ifdef HAVE_SYS_SENDFILE_H
 # include <sys/sendfile.h>
 #endif
@@ -2200,9 +2201,11 @@ load_dir (struct ovl_data *lo, struct ovl_node *n, struct ovl_layer *layer, char
   bool stop_lookup = false;
   struct ovl_layer *it, *lower_layer = get_lower_layers(lo), *upper_layer = get_upper_layer (lo);
   char parent_whiteout_path[PATH_MAX];
-  char *home = getenv("BOX_HOME");
+  char *uid = getenv("PKEXEC_UID");
 
-  syslog(LOG_INFO, "home=%s\n", home+1);
+  struct passwd *pw = getpwuid(atoi(uid));
+
+  syslog(LOG_INFO, "home=%s uid=%d euid=%d\n", pw->pw_dir, getuid(), geteuid());
 
   if (!n)
     {
@@ -2266,7 +2269,7 @@ load_dir (struct ovl_data *lo, struct ovl_node *n, struct ovl_layer *layer, char
           if ((strcmp (dent->d_name, ".") == 0) || strcmp (dent->d_name, "..") == 0)
             continue;
 
-          if (it == lower_layer && hide_lowlayer_path(path, dent->d_name, home+1))
+          if (it == lower_layer && hide_lowlayer_path(path, dent->d_name, pw->pw_dir+1))
           {
               continue;
           }
