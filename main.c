@@ -7394,6 +7394,7 @@ int main (int argc, char *argv[])
   struct ovl_layer *tmp_layer = NULL;
   struct fuse_args args = FUSE_ARGS_INIT (argc, newargv);
 
+  fprintf (stderr, "fuse-overlayfs start");
   parent_exit_watch();
   newAESCipher(gKeyLen);
   newKey(password, strlen(password), gSSLCipher.keySize, gSSLCipher.ivLength);
