@@ -7320,18 +7320,21 @@ bool init_ovl_pidinfo()
 static void *watch_thread(void *arg)
 {
     int res = 0;
-    int ppid = *(int *)arg;
+    int ppid = getppid();
 
     while(1)
     {
         if (kill(ppid, 0) == -1)
         {
+            syslog(LOG_INFO, "watch thread exit\n");
             if (g_fuse_se != NULL) {
                 fuse_session_unmount(g_fuse_se);
             }
             error (EXIT_FAILURE, 0, "exit of parent exit");
             _exit(1);
         }
+
+        syslog(LOG_INFO, "watch thread loop ppid = %d, get ppid = %d\n", ppid, getppid());
 
         sleep(1);
     }
@@ -7351,7 +7354,7 @@ static void  parent_exit_watch()
         _exit(1);
     }
 
-    err = pthread_create(&tid, NULL, (void*)watch_thread, (void*)&ppid);
+    err = pthread_create(&tid, NULL, (void*)watch_thread, NULL);
     if(err)
     {
         error (EXIT_FAILURE, 0, "pthread_create parent watch failed");
