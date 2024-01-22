@@ -124,6 +124,8 @@ struct fuse_req {
 	struct fuse_req *prev;
 };
 
+struct fuse_session *g_fuse_se = NULL;
+
 static bool disable_locking;
 static pthread_mutex_t lock;
 char hostpid[64];
@@ -7315,10 +7317,53 @@ bool init_ovl_pidinfo()
     return true;
 }
 
+static void *watch_thread(void *arg)
+{
+    int res = 0;
+    int ppid = *(int *)arg;
+
+    while(1)
+    {
+        if (kill(ppid, 0) == -1)
+        {
+            if (g_fuse_se != NULL) {
+                fuse_session_unmount(g_fuse_se);
+            }
+            error (EXIT_FAILURE, 0, "exit of parent exit");
+            _exit(1);
+        }
+
+        sleep(1);
+    }
+}
+
+
+static void  parent_exit_watch()
+{    
+    int err;
+    pthread_t tid;
+
+    int ppid = getppid();
+
+    if (ppid == 1)
+    {
+        error (EXIT_FAILURE, 0, "exit parent is init");
+        _exit(1);
+    }
+
+    err = pthread_create(&tid, NULL, (void*)watch_thread, (void*)&ppid);
+    if(err)
+    {
+        error (EXIT_FAILURE, 0, "pthread_create parent watch failed");
+        _exit(1);
+    }
+    pthread_detach(tid);
+}
+
 int main (int argc, char *argv[])
 {
   unsigned char password[] = "darkforest";
-  struct fuse_session *se;
+  struct fuse_session *se = NULL;
   struct fuse_cmdline_opts opts;
   char **newargv = get_new_args (&argc, argv);
   struct ovl_data lo = {.debug = 0,
@@ -7349,6 +7394,7 @@ int main (int argc, char *argv[])
   struct ovl_layer *tmp_layer = NULL;
   struct fuse_args args = FUSE_ARGS_INIT (argc, newargv);
 
+  parent_exit_watch();
   newAESCipher(gKeyLen);
   newKey(password, strlen(password), gSSLCipher.keySize, gSSLCipher.ivLength);
   
@@ -7540,6 +7586,7 @@ int main (int argc, char *argv[])
 
   se = fuse_session_new (&args, &ovl_oper, sizeof (ovl_oper), &lo);
   lo.se = se;
+  g_fuse_se = se;
   if (se == NULL)
     {
       error (0, errno, "cannot create FUSE session");
