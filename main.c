@@ -2172,6 +2172,9 @@ static int hide_lowlayer_path(char *path, char *name, char *home)
     };
 
     if (0 == strncmp(path, home, strlen(home))) {
+        if (0 == strcmp(name, ".Xauthority")) {
+            return 1;
+        }
         if (0 == strncmp(name, ".", strlen("."))) {
             return 0;
         }
