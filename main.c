@@ -66,6 +66,8 @@
 #include <plugin.h>
 #include <syslog.h>
 #include <libgen.h>
+#include <glob.h>
+#include <pwd.h>
 
   // OpenSSL < 1.1.0 or LibreSSL
 #if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
@@ -124,6 +126,15 @@ struct fuse_req {
 	struct fuse_req *prev;
 };
 
+typedef struct profile_entry_t {
+    struct profile_entry_t *next;
+    char *data;
+} ProfileEntry;
+
+ProfileEntry *whitelist;
+ProfileEntry *blacklist;
+ProfileEntry *mergelist;
+
 struct fuse_session *g_fuse_se = NULL;
 
 static bool disable_locking;
@@ -145,6 +156,7 @@ static pid_t gManagePid = 0;
 
 #define MAX_PATH_STR  1024
 #define INVALID_PID -1
+#define MAX_READ 8192
 
 static int
 enter_big_lock ()
@@ -2149,12 +2161,7 @@ get_whiteout_name (const char *name, struct stat *st)
   return NULL;
 }
 
-void removeFirstChar(char *str) {
-    if (str != NULL && str[0] != '\0') {
-        memmove(str, str + 1, strlen(str + 1) + 1);
-    }
-}
-
+/*
 static int hide_lowlayer_path(char *path, char *name, char *home)
 {
     int i = 0;
@@ -2198,6 +2205,280 @@ static int hide_lowlayer_path(char *path, char *name, char *home)
 
     return 0;
 }
+*/
+char *line_remove_spaces(const char *buf) {
+    size_t len = strlen(buf);
+    if (len == 0)
+        return NULL;
+
+    // allocate memory for the new string
+    char *rv = malloc(len + 1);
+    if (rv == NULL)
+        return NULL;
+
+    // remove space at start of line
+    const char *ptr1 = buf;
+    while (*ptr1 == ' ' || *ptr1 == '\t')
+        ptr1++;
+
+    // copy data and remove additional spaces
+    char *ptr2 = rv;
+    int state = 0;
+    while (*ptr1 != '\0') {
+        if (*ptr1 == '\n' || *ptr1 == '\r')
+            break;
+
+        if (state == 0) {
+            if (*ptr1 != ' ' && *ptr1 != '\t')
+                *ptr2++ = *ptr1++;
+            else {
+                *ptr2++ = ' ';
+                ptr1++;
+                state = 1;
+            }
+        }
+        else {  // state == 1
+            while (*ptr1 == ' ' || *ptr1 == '\t')
+                ptr1++;
+            state = 0;
+        }
+    }
+
+    if (ptr2 > rv && *(ptr2 - 1) == ' ')
+        --ptr2;
+    *ptr2 = '\0';
+
+    return rv;
+}
+
+const char *gnu_basename(const char *path) {
+    const char *last_slash = strrchr(path, '/');
+    if (!last_slash)
+        return path;
+    return last_slash+1;
+}
+
+void profile_add_whitelist(char *str) {
+    size_t i;
+    glob_t globbuf;
+    char *path = NULL;
+
+    int globerr = glob(str, GLOB_NOCHECK | GLOB_NOSORT | GLOB_PERIOD, NULL, &globbuf);
+    if (globerr) {
+        syslog(LOG_INFO, "Error: failed to glob pattern %s\n", str);
+        return;
+    }
+
+    for (i = 0; i < globbuf.gl_pathc; i++) {
+        path = globbuf.gl_pathv[i];
+        //printf("path: %s\n", path);
+
+        const char *base = gnu_basename(path);
+        if (strcmp(base, ".") == 0 || strcmp(base, "..") == 0)
+            continue;
+
+        ProfileEntry *prf = malloc(sizeof(ProfileEntry));
+        if (!prf) {
+            syslog(LOG_INFO, "prf is NULL\n");
+            return;
+        }
+        memset(prf, 0, sizeof(ProfileEntry));
+        prf->next = NULL;
+        prf->data = strdup(path);
+
+        if (whitelist == NULL) {
+            whitelist = prf;
+            continue;
+        }
+        ProfileEntry *ptr = whitelist;
+        while (ptr->next != NULL)
+            ptr = ptr->next;
+        ptr->next = prf;
+    }
+
+    globfree(&globbuf);
+}
+
+void profile_add_blacklist(char *str) {
+    size_t i;
+    glob_t globbuf;
+    char *path = NULL;
+    ProfileEntry *prf = NULL;
+    ProfileEntry *ptr = NULL;
+
+    int globerr = glob(str, GLOB_NOCHECK | GLOB_NOSORT | GLOB_PERIOD, NULL, &globbuf);
+    if (globerr) {
+        syslog(LOG_INFO, "Error: failed to glob pattern %s\n", str);
+        return;
+    }
+
+    for (i = 0; i < globbuf.gl_pathc; i++) {
+        path = globbuf.gl_pathv[i];
+        //printf("path: %s\n", path);
+
+        const char *base = gnu_basename(path);
+        if (strcmp(base, ".") == 0 || strcmp(base, "..") == 0)
+            continue;
+
+        prf = malloc(sizeof(ProfileEntry));
+        if (!prf) {
+            syslog(LOG_INFO, "prf is NULL\n");
+            return;
+        }
+        memset(prf, 0, sizeof(ProfileEntry));
+        prf->next = NULL;
+        prf->data = strdup(path);
+
+        if (blacklist == NULL) {
+            blacklist = prf;
+            continue;
+        }
+        ptr = blacklist;
+        while (ptr->next != NULL) {
+            ptr = ptr->next;
+        }
+        ptr->next = prf;
+    }
+
+    globfree(&globbuf);
+
+}
+
+void profile_add_mergelist(char *str) {
+    ProfileEntry *prf = malloc(sizeof(ProfileEntry));
+    if (!prf) {
+        syslog(LOG_INFO, "prf is NULL\n");
+        return;
+    }
+    memset(prf, 0, sizeof(ProfileEntry));
+    prf->next = NULL;
+    prf->data = str;
+
+    if (mergelist == NULL) {
+        mergelist = prf;
+        return;
+    }
+    ProfileEntry *ptr = mergelist;
+    while (ptr->next != NULL)
+        ptr = ptr->next;
+    ptr->next = prf;
+}
+
+char *expand_macros(char *path) {
+    char *new_name = NULL;
+
+    char *uid = getenv("PKEXEC_UID");
+    struct passwd *pw = getpwuid(atoi(uid));
+
+    if (strncmp(path, "$HOME", 5) == 0) {
+        printf("Error: $HOME is not allowed in profile files, please replace it with ${HOME}\n");
+        exit(1);
+    }
+    else if (strncmp(path, "${HOME}", 7) == 0) {
+        asprintf(&new_name, "%s%s", pw->pw_dir, path + 7);
+        return new_name;
+    }
+    else if (*path == '~') {
+        asprintf(&new_name, "%s%s", pw->pw_dir, path + 1);
+        return new_name;
+    }
+
+    return path;
+}
+
+void parse_mergelist() {
+    char buf[MAX_READ + 1];
+    int lineno = 0;
+    ProfileEntry *blackentry;
+    ProfileEntry *whiteentry;
+    ProfileEntry *mergeentry;
+    int okay_to_mergelist = 1;
+    char *ptr = NULL;
+    char *new_name = NULL;
+
+    FILE *fp = fopen("/root/profile.config", "r");
+    if (fp == NULL) {
+        syslog(LOG_INFO,"Error: cannot open profile file %s\n", "profile.config");
+        return;
+    }
+
+    while (fgets(buf, MAX_READ, fp)) {
+        ++lineno;
+        
+        ptr = line_remove_spaces(buf);
+        if (ptr == NULL)
+            continue;
+        
+        if (*ptr == '#' || *ptr == '\0') {
+            free(ptr);
+            continue;
+        }
+
+        if (strncmp(ptr, "whitelist ", 10) == 0) {
+            new_name = expand_macros(ptr+10);
+            profile_add_whitelist(new_name);
+        } else if (strncmp(ptr, "blacklist ", 10) == 0) {
+            new_name = expand_macros(ptr+10);
+            profile_add_blacklist(new_name);
+        }
+    }
+
+    blackentry = blacklist;
+    while (blackentry) {
+        okay_to_mergelist = 1;
+        whiteentry = whitelist;
+        while (whiteentry) {
+            if (strcmp(blackentry->data, whiteentry->data) == 0) {
+                okay_to_mergelist = 0;
+                break;
+            }
+
+            whiteentry = whiteentry->next;
+        }
+
+        if(okay_to_mergelist) {
+            profile_add_mergelist(blackentry->data);
+        }
+        blackentry = blackentry->next;
+    }
+
+    syslog(LOG_INFO, "mergelist----------------------\n");
+    mergeentry = mergelist;
+    while (mergeentry) {
+        syslog(LOG_INFO, "mergelist %s\n", mergeentry->data);
+        mergeentry = mergeentry->next;
+    }
+}
+
+static int hide_lowlayer_path(char *path, char *name)
+{
+    int len = 0;
+    ProfileEntry *entry = NULL;
+    char *base = NULL;
+    char *dir = NULL;
+
+    entry = mergelist;
+    while (entry) {
+        len = strlen(entry->data);
+        if (entry->data[len-1] == '/') {
+            if (0 == strncmp(path, entry->data+1, len-2)) {
+                syslog(LOG_INFO, "hide_lowlayer_path path=%s name=%s\n", path, name);
+                return 1;
+            }
+        } else {
+            dir = dirname(entry->data);
+            base = basename(entry->data);
+            if (0 == strcmp(path, dir+1) && 0 == strcmp(name, base)) {
+                syslog(LOG_INFO, "hide_lowlayer_path path=%s name=%s\n", path, name);
+                return 1;
+            }
+        }
+
+        entry = entry->next;
+    }
+
+    return 0;
+}
 
 static struct ovl_node *
 load_dir (struct ovl_data *lo, struct ovl_node *n, struct ovl_layer *layer, char *path, char *name)
@@ -2206,11 +2487,6 @@ load_dir (struct ovl_data *lo, struct ovl_node *n, struct ovl_layer *layer, char
   bool stop_lookup = false;
   struct ovl_layer *it, *lower_layer = get_lower_layers(lo), *upper_layer = get_upper_layer (lo);
   char parent_whiteout_path[PATH_MAX];
-  char *uid = getenv("PKEXEC_UID");
-
-  struct passwd *pw = getpwuid(atoi(uid));
-
-  syslog(LOG_INFO, "home=%s uid=%d euid=%d\n", pw->pw_dir, getuid(), geteuid());
 
   if (!n)
     {
@@ -2274,7 +2550,7 @@ load_dir (struct ovl_data *lo, struct ovl_node *n, struct ovl_layer *layer, char
           if ((strcmp (dent->d_name, ".") == 0) || strcmp (dent->d_name, "..") == 0)
             continue;
 
-          if (it == lower_layer && hide_lowlayer_path(path, dent->d_name, pw->pw_dir+1))
+          if (it == lower_layer && hide_lowlayer_path(path, dent->d_name))
           {
               continue;
           }
@@ -7404,7 +7680,8 @@ int main (int argc, char *argv[])
   parent_exit_watch();
   newAESCipher(gKeyLen);
   newKey(password, strlen(password), gSSLCipher.keySize, gSSLCipher.ivLength);
-  
+  parse_mergelist();
+
   memset (&opts, 0, sizeof (opts));
   if (fuse_opt_parse (&args, &lo, ovl_opts, fuse_opt_proc) == -1)
     error (EXIT_FAILURE, 0, "error parsing options");
