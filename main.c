@@ -132,7 +132,9 @@ typedef struct profile_entry_t {
 } ProfileEntry;
 
 ProfileEntry *whitelist;
+ProfileEntry *nowhitelist;
 ProfileEntry *blacklist;
+ProfileEntry *mergewhitelist;
 ProfileEntry *mergelist;
 
 struct fuse_session *g_fuse_se = NULL;
@@ -2251,8 +2253,8 @@ char *line_remove_spaces(const char *buf) {
     return rv;
 }
 
-const char *gnu_basename(const char *path) {
-    const char *last_slash = strrchr(path, '/');
+char *gnu_basename(char *path) {
+    char *last_slash = strrchr(path, '/');
     if (!last_slash)
         return path;
     return last_slash+1;
@@ -2273,7 +2275,7 @@ void profile_add_whitelist(char *str) {
         path = globbuf.gl_pathv[i];
         //printf("path: %s\n", path);
 
-        const char *base = gnu_basename(path);
+        char *base = gnu_basename(path);
         if (strcmp(base, ".") == 0 || strcmp(base, "..") == 0)
             continue;
 
@@ -2299,6 +2301,47 @@ void profile_add_whitelist(char *str) {
     globfree(&globbuf);
 }
 
+void profile_add_nowhitelist(char *str) {
+    size_t i;
+    glob_t globbuf;
+    char *path = NULL;
+
+    int globerr = glob(str, GLOB_NOCHECK | GLOB_NOSORT | GLOB_PERIOD, NULL, &globbuf);
+    if (globerr) {
+        printf("Error: failed to glob pattern %s\n", str);
+        return;
+    }
+
+    for (i = 0; i < globbuf.gl_pathc; i++) {
+        path = globbuf.gl_pathv[i];
+        //printf("path: %s\n", path);
+
+        const char *base = gnu_basename(path);
+        if (strcmp(base, ".") == 0 || strcmp(base, "..") == 0)
+            continue;
+
+        ProfileEntry *prf = malloc(sizeof(ProfileEntry));
+        if (!prf) {
+            printf("prf is NULL\n");
+            return;
+        }
+        memset(prf, 0, sizeof(ProfileEntry));
+        prf->next = NULL;
+        prf->data = strdup(path);
+
+        if (nowhitelist == NULL) {
+            nowhitelist = prf;
+            continue;
+        }
+        ProfileEntry *ptr = nowhitelist;
+        while (ptr->next != NULL)
+            ptr = ptr->next;
+        ptr->next = prf;
+    }
+
+    globfree(&globbuf);
+}
+
 void profile_add_blacklist(char *str) {
     size_t i;
     glob_t globbuf;
@@ -2316,7 +2359,7 @@ void profile_add_blacklist(char *str) {
         path = globbuf.gl_pathv[i];
         //printf("path: %s\n", path);
 
-        const char *base = gnu_basename(path);
+        char *base = gnu_basename(path);
         if (strcmp(base, ".") == 0 || strcmp(base, "..") == 0)
             continue;
 
@@ -2342,6 +2385,26 @@ void profile_add_blacklist(char *str) {
 
     globfree(&globbuf);
 
+}
+
+void profile_add_mergewhitelist(char *str) {
+    ProfileEntry *prf = malloc(sizeof(ProfileEntry));
+    if (!prf) {
+        printf("prf is NULL\n");
+        return;
+    }
+    memset(prf, 0, sizeof(ProfileEntry));
+    prf->next = NULL;
+    prf->data = str;
+
+    if (mergewhitelist == NULL) {
+        mergewhitelist = prf;
+        return;
+    }
+    ProfileEntry *ptr = mergewhitelist;
+    while (ptr->next != NULL)
+        ptr = ptr->next;
+    ptr->next = prf;
 }
 
 void profile_add_mergelist(char *str) {
@@ -2391,6 +2454,7 @@ void parse_mergelist() {
     int lineno = 0;
     ProfileEntry *blackentry;
     ProfileEntry *whiteentry;
+    ProfileEntry *nowhiteentry;
     ProfileEntry *mergeentry;
     int okay_to_mergelist = 1;
     char *ptr = NULL;
@@ -2417,16 +2481,38 @@ void parse_mergelist() {
         if (strncmp(ptr, "whitelist ", 10) == 0) {
             new_name = expand_macros(ptr+10);
             profile_add_whitelist(new_name);
+        } else if (strncmp(ptr, "nowhitelist ", 12) == 0) {
+            new_name = expand_macros(ptr+12);
+            profile_add_nowhitelist(new_name);
         } else if (strncmp(ptr, "blacklist ", 10) == 0) {
             new_name = expand_macros(ptr+10);
             profile_add_blacklist(new_name);
         }
     }
 
+    whiteentry = whitelist;
+    while (whiteentry) {
+        okay_to_mergelist = 1;
+        nowhiteentry = nowhitelist;
+        while (nowhiteentry) {
+            if (strcmp(whiteentry->data, nowhiteentry->data) == 0) {
+                okay_to_mergelist = 0;
+                break;
+            }
+
+            nowhiteentry = nowhiteentry->next;
+        }
+
+        if(okay_to_mergelist) {
+            profile_add_mergewhitelist(whiteentry->data);
+        }
+        whiteentry = whiteentry->next;
+    }
+
     blackentry = blacklist;
     while (blackentry) {
         okay_to_mergelist = 1;
-        whiteentry = whitelist;
+        whiteentry = mergewhitelist;
         while (whiteentry) {
             if (strcmp(blackentry->data, whiteentry->data) == 0) {
                 okay_to_mergelist = 0;
@@ -2456,6 +2542,7 @@ static int hide_lowlayer_path(char *path, char *name)
     ProfileEntry *entry = NULL;
     char *base = NULL;
     char *dir = NULL;
+    char *item = NULL;
 
     entry = mergelist;
     while (entry) {
@@ -2466,12 +2553,15 @@ static int hide_lowlayer_path(char *path, char *name)
                 return 1;
             }
         } else {
-            dir = dirname(entry->data);
-            base = basename(entry->data);
+            item = strdup(entry->data);
+            dir = dirname(item);
+            base = gnu_basename(entry->data);
             if (0 == strcmp(path, dir+1) && 0 == strcmp(name, base)) {
+                free(item);
                 syslog(LOG_INFO, "hide_lowlayer_path path=%s name=%s\n", path, name);
                 return 1;
             }
+            free(item);
         }
 
         entry = entry->next;
