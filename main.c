@@ -2260,48 +2260,27 @@ char *gnu_basename(char *path) {
     return last_slash+1;
 }
 
-void profile_add_whitelist(char *str) {
-    size_t i;
-    glob_t globbuf;
-    char *path = NULL;
-
-    int globerr = glob(str, GLOB_NOCHECK | GLOB_NOSORT | GLOB_PERIOD, NULL, &globbuf);
-    if (globerr) {
-        syslog(LOG_INFO, "Error: failed to glob pattern %s\n", str);
+void profile_add_list(char *str, ProfileEntry **list) {
+    ProfileEntry *prf = malloc(sizeof(ProfileEntry));
+    if (!prf) {
+        printf("prf is NULL\n");
         return;
     }
+    memset(prf, 0, sizeof(ProfileEntry));
+    prf->next = NULL;
+    prf->data = str;
 
-    for (i = 0; i < globbuf.gl_pathc; i++) {
-        path = globbuf.gl_pathv[i];
-        //printf("path: %s\n", path);
-
-        char *base = gnu_basename(path);
-        if (strcmp(base, ".") == 0 || strcmp(base, "..") == 0)
-            continue;
-
-        ProfileEntry *prf = malloc(sizeof(ProfileEntry));
-        if (!prf) {
-            syslog(LOG_INFO, "prf is NULL\n");
-            return;
-        }
-        memset(prf, 0, sizeof(ProfileEntry));
-        prf->next = NULL;
-        prf->data = strdup(path);
-
-        if (whitelist == NULL) {
-            whitelist = prf;
-            continue;
-        }
-        ProfileEntry *ptr = whitelist;
-        while (ptr->next != NULL)
-            ptr = ptr->next;
-        ptr->next = prf;
+    if (*list == NULL) {
+        *list = prf;
+        return;
     }
-
-    globfree(&globbuf);
+    ProfileEntry *ptr = *list;
+    while (ptr->next != NULL)
+        ptr = ptr->next;
+    ptr->next = prf;
 }
 
-void profile_add_nowhitelist(char *str) {
+void profile_add_globlist(char *str, ProfileEntry **list) {
     size_t i;
     glob_t globbuf;
     char *path = NULL;
@@ -2320,111 +2299,36 @@ void profile_add_nowhitelist(char *str) {
         if (strcmp(base, ".") == 0 || strcmp(base, "..") == 0)
             continue;
 
-        ProfileEntry *prf = malloc(sizeof(ProfileEntry));
-        if (!prf) {
-            printf("prf is NULL\n");
-            return;
-        }
-        memset(prf, 0, sizeof(ProfileEntry));
-        prf->next = NULL;
-        prf->data = strdup(path);
-
-        if (nowhitelist == NULL) {
-            nowhitelist = prf;
-            continue;
-        }
-        ProfileEntry *ptr = nowhitelist;
-        while (ptr->next != NULL)
-            ptr = ptr->next;
-        ptr->next = prf;
+        profile_add_list(strdup(path), list);
     }
 
     globfree(&globbuf);
 }
 
-void profile_add_blacklist(char *str) {
-    size_t i;
-    glob_t globbuf;
-    char *path = NULL;
-    ProfileEntry *prf = NULL;
-    ProfileEntry *ptr = NULL;
+void profile_mergelist(ProfileEntry **includelist, ProfileEntry **excludelist, ProfileEntry **mergelist) {
+    ProfileEntry *includeentry;
+    ProfileEntry *excludeentry;
+    int mergeflag = 1;
 
-    int globerr = glob(str, GLOB_NOCHECK | GLOB_NOSORT | GLOB_PERIOD, NULL, &globbuf);
-    if (globerr) {
-        syslog(LOG_INFO, "Error: failed to glob pattern %s\n", str);
-        return;
-    }
+    includeentry = *includelist;
+    while (includeentry) {
+        mergeflag = 1;
+        excludeentry = *excludelist;
+        while (excludeentry) {
+            if (strcmp(includeentry->data, excludeentry->data) == 0) {
+                mergeflag = 0;
+                break;
+            }
 
-    for (i = 0; i < globbuf.gl_pathc; i++) {
-        path = globbuf.gl_pathv[i];
-        //printf("path: %s\n", path);
-
-        char *base = gnu_basename(path);
-        if (strcmp(base, ".") == 0 || strcmp(base, "..") == 0)
-            continue;
-
-        prf = malloc(sizeof(ProfileEntry));
-        if (!prf) {
-            syslog(LOG_INFO, "prf is NULL\n");
-            return;
+            excludeentry = excludeentry->next;
         }
-        memset(prf, 0, sizeof(ProfileEntry));
-        prf->next = NULL;
-        prf->data = strdup(path);
 
-        if (blacklist == NULL) {
-            blacklist = prf;
-            continue;
+        if(mergeflag) {
+            profile_add_list(includeentry->data, mergelist);
         }
-        ptr = blacklist;
-        while (ptr->next != NULL) {
-            ptr = ptr->next;
-        }
-        ptr->next = prf;
+        includeentry = includeentry->next;
     }
 
-    globfree(&globbuf);
-
-}
-
-void profile_add_mergewhitelist(char *str) {
-    ProfileEntry *prf = malloc(sizeof(ProfileEntry));
-    if (!prf) {
-        printf("prf is NULL\n");
-        return;
-    }
-    memset(prf, 0, sizeof(ProfileEntry));
-    prf->next = NULL;
-    prf->data = str;
-
-    if (mergewhitelist == NULL) {
-        mergewhitelist = prf;
-        return;
-    }
-    ProfileEntry *ptr = mergewhitelist;
-    while (ptr->next != NULL)
-        ptr = ptr->next;
-    ptr->next = prf;
-}
-
-void profile_add_mergelist(char *str) {
-    ProfileEntry *prf = malloc(sizeof(ProfileEntry));
-    if (!prf) {
-        syslog(LOG_INFO, "prf is NULL\n");
-        return;
-    }
-    memset(prf, 0, sizeof(ProfileEntry));
-    prf->next = NULL;
-    prf->data = str;
-
-    if (mergelist == NULL) {
-        mergelist = prf;
-        return;
-    }
-    ProfileEntry *ptr = mergelist;
-    while (ptr->next != NULL)
-        ptr = ptr->next;
-    ptr->next = prf;
 }
 
 char *expand_macros(char *path) {
@@ -2452,11 +2356,7 @@ char *expand_macros(char *path) {
 void parse_mergelist() {
     char buf[MAX_READ + 1];
     int lineno = 0;
-    ProfileEntry *blackentry;
-    ProfileEntry *whiteentry;
-    ProfileEntry *nowhiteentry;
-    ProfileEntry *mergeentry;
-    int okay_to_mergelist = 1;
+    ProfileEntry *entry;
     char *ptr = NULL;
     char *new_name = NULL;
 
@@ -2481,66 +2381,31 @@ void parse_mergelist() {
         if (strncmp(ptr, "whitelist ", 10) == 0) {
             new_name = expand_macros(ptr+10);
             if (new_name) {
-                profile_add_whitelist(new_name);
+                profile_add_globlist(new_name, &whitelist);
             }
         } else if (strncmp(ptr, "nowhitelist ", 12) == 0) {
             new_name = expand_macros(ptr+12);
             if (new_name) {
-                profile_add_nowhitelist(new_name);
+                profile_add_globlist(new_name, &nowhitelist);
             }
         } else if (strncmp(ptr, "blacklist ", 10) == 0) {
             new_name = expand_macros(ptr+10);
             if (new_name) {
-                profile_add_blacklist(new_name);
+                profile_add_globlist(new_name, &blacklist);
             }
         }
         if (new_name)
             free(new_name);
     }
 
-    whiteentry = whitelist;
-    while (whiteentry) {
-        okay_to_mergelist = 1;
-        nowhiteentry = nowhitelist;
-        while (nowhiteentry) {
-            if (strcmp(whiteentry->data, nowhiteentry->data) == 0) {
-                okay_to_mergelist = 0;
-                break;
-            }
-
-            nowhiteentry = nowhiteentry->next;
-        }
-
-        if(okay_to_mergelist) {
-            profile_add_mergewhitelist(whiteentry->data);
-        }
-        whiteentry = whiteentry->next;
-    }
-
-    blackentry = blacklist;
-    while (blackentry) {
-        okay_to_mergelist = 1;
-        whiteentry = mergewhitelist;
-        while (whiteentry) {
-            if (strcmp(blackentry->data, whiteentry->data) == 0) {
-                okay_to_mergelist = 0;
-                break;
-            }
-
-            whiteentry = whiteentry->next;
-        }
-
-        if(okay_to_mergelist) {
-            profile_add_mergelist(blackentry->data);
-        }
-        blackentry = blackentry->next;
-    }
+    profile_mergelist(&whitelist, &nowhitelist, &mergewhitelist);
+    profile_mergelist(&blacklist, &mergewhitelist, &mergelist);
 
     syslog(LOG_INFO, "mergelist----------------------\n");
-    mergeentry = mergelist;
-    while (mergeentry) {
-        syslog(LOG_INFO, "mergelist %s\n", mergeentry->data);
-        mergeentry = mergeentry->next;
+    entry = mergelist;
+    while (entry) {
+        syslog(LOG_INFO, "mergelist %s\n", entry->data);
+        entry = entry->next;
     }
 }
 
