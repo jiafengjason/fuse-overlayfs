@@ -2360,7 +2360,7 @@ void parse_mergelist() {
     char *ptr = NULL;
     char *new_name = NULL;
 
-    FILE *fp = fopen("/root/profile.config", "r");
+    FILE *fp = fopen("/home/jailbox/profile.config", "r");
     if (fp == NULL) {
         syslog(LOG_INFO,"Error: cannot open profile file %s\n", "profile.config");
         return;
