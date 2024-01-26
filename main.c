@@ -2435,7 +2435,7 @@ char *expand_macros(char *path) {
 
     if (strncmp(path, "$HOME", 5) == 0) {
         printf("Error: $HOME is not allowed in profile files, please replace it with ${HOME}\n");
-        exit(1);
+        return NULL;
     }
     else if (strncmp(path, "${HOME}", 7) == 0) {
         asprintf(&new_name, "%s%s", pw->pw_dir, path + 7);
@@ -2446,7 +2446,7 @@ char *expand_macros(char *path) {
         return new_name;
     }
 
-    return path;
+    return strdup(path);
 }
 
 void parse_mergelist() {
@@ -2480,14 +2480,22 @@ void parse_mergelist() {
 
         if (strncmp(ptr, "whitelist ", 10) == 0) {
             new_name = expand_macros(ptr+10);
-            profile_add_whitelist(new_name);
+            if (new_name) {
+                profile_add_whitelist(new_name);
+            }
         } else if (strncmp(ptr, "nowhitelist ", 12) == 0) {
             new_name = expand_macros(ptr+12);
-            profile_add_nowhitelist(new_name);
+            if (new_name) {
+                profile_add_nowhitelist(new_name);
+            }
         } else if (strncmp(ptr, "blacklist ", 10) == 0) {
             new_name = expand_macros(ptr+10);
-            profile_add_blacklist(new_name);
+            if (new_name) {
+                profile_add_blacklist(new_name);
+            }
         }
+        if (new_name)
+            free(new_name);
     }
 
     whiteentry = whitelist;
