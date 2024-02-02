@@ -142,9 +142,27 @@ const int MAX_IVLENGTH = 16;   // 128 bit (AES block size, Blowfish has 64)
 
 static pid_t gOvlPid = 0;
 static pid_t gManagePid = 0;
+static char gMntNs[128] = {0};
 
 #define MAX_PATH_STR  1024
 #define INVALID_PID -1
+
+
+static void pid_mnt_ns(pid_t pid, char *mnt_ns, int len)
+{
+    char *path;
+    char mntns[128];
+    if (asprintf(&path, "/proc/%u/ns/mnt", pid) == -1)
+    	return;
+    
+    ssize_t n = readlink(path, mntns, sizeof(mntns) - 1);
+    mntns[n] = '\0';
+    
+    snprintf(mnt_ns, len, "%s", mntns);
+
+    free(path);
+    return;
+}
 
 static int
 enter_big_lock ()
@@ -1049,16 +1067,78 @@ static pid_t getParentPid(pid_t pid)
   return fpid;
 }
 
+char *pid_proc_comm(const pid_t pid) {
+	// open /proc/pid/cmdline file
+	char *fname;
+	int fd;
+	if (asprintf(&fname, "/proc/%d/comm", pid) == -1)
+		return NULL;
+	if ((fd = open(fname, O_RDONLY)) < 0) {
+		free(fname);
+		return NULL;
+	}
+	free(fname);
+
+	// read file
+	char buffer[4096];
+	ssize_t len;
+	if ((len = read(fd, buffer, sizeof(buffer) - 1)) <= 0) {
+		close(fd);
+		return NULL;
+	}
+	buffer[len] = '\0';
+	close(fd);
+
+	// remove \n
+	char *ptr = strchr(buffer, '\n');
+	if (ptr)
+		*ptr = '\0';
+
+	// return a malloc copy of the command line
+	char *rv = strdup(buffer);
+	if (!rv)
+		return NULL;
+	if (strlen(rv) == 0) {
+		free(rv);
+		return NULL;
+	}
+	return rv;
+}
+
+
 int isInBox(fuse_req_t req, pid_t accessPid)
 {
     char statPath[MAX_PATH_STR] = {0};
     char buf[MAX_PATH_STR] = {0};
     char procName[MAX_PATH_STR]={0};
     char accessprocName[MAX_PATH_STR]={0};
+    char accessprocMntNs[128]={0};
     pid_t pid =accessPid;
     pid_t fpid = 0;
     struct stat st;
     ssize_t ret = 0;
+
+    //idle
+    if(pid==0)
+    {
+        return true;
+    }
+
+    char *comm = pid_proc_comm(accessPid);
+
+    if (comm) {
+        snprintf(accessprocName, sizeof(accessprocName), "%s", comm);
+        free(comm);
+    
+        pid_mnt_ns(accessPid, accessprocMntNs, 128);
+        //syslog(LOG_INFO, "accessPid:%d, accessprocName=%s, accessMntns=%s\n", accessPid, accessprocName, accessprocMntNs);
+	if (strcmp(gMntNs, accessprocMntNs) != 0) {
+		return true;
+	}
+    } else {
+        syslog(LOG_INFO, "failed get accessprocName, id=%d\n", accessPid);
+        return true;
+    }
 
     while(1)
     {
@@ -1105,11 +1185,6 @@ int isInBox(fuse_req_t req, pid_t accessPid)
 
         sscanf(buf,"%*d %*c%s %*c %d %*s",procName,&fpid);
         procName[strlen(procName)-1]='\0';
-
-	if (pid == accessPid)
-	{
-     	    strcpy(accessprocName, procName);
-	}
 
         //allow firejail --join
         if(strncmp(procName, "firejail", strlen("firejail"))==0)
@@ -7402,6 +7477,9 @@ int main (int argc, char *argv[])
 
   fprintf (stderr, "fuse-overlayfs start");
   parent_exit_watch();
+
+  pid_mnt_ns(getpid(), gMntNs, 128);
+
   newAESCipher(gKeyLen);
   newKey(password, strlen(password), gSSLCipher.keySize, gSSLCipher.ivLength);
   
