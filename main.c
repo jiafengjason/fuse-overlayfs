@@ -66,6 +66,8 @@
 #include <plugin.h>
 #include <syslog.h>
 #include <libgen.h>
+#include <glob.h>
+#include <pwd.h>
 
   // OpenSSL < 1.1.0 or LibreSSL
 #if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
@@ -124,6 +126,17 @@ struct fuse_req {
 	struct fuse_req *prev;
 };
 
+typedef struct profile_entry_t {
+    struct profile_entry_t *next;
+    char *data;
+} ProfileEntry;
+
+ProfileEntry *whitelist;
+ProfileEntry *nowhitelist;
+ProfileEntry *blacklist;
+ProfileEntry *mergewhitelist;
+ProfileEntry *mergelist;
+
 struct fuse_session *g_fuse_se = NULL;
 
 static bool disable_locking;
@@ -146,6 +159,10 @@ static char gMntNs[128] = {0};
 
 #define MAX_PATH_STR  1024
 #define INVALID_PID -1
+#define MAX_READ 8192
+
+#define BASE_FILE_PATH "/var/lib/dpkg/info/"
+struct ovl_node *g_basefs_root;
 
 
 static void pid_mnt_ns(pid_t pid, char *mnt_ns, int len)
@@ -1513,17 +1530,21 @@ node_free (void *p)
   stats.nodes--;
   free (n->name);
   free (n->path);
-  free (n->cache.data);
 
-  EVP_CIPHER_CTX_free(n->block_enc);
-  EVP_CIPHER_CTX_free(n->block_dec);
-  EVP_CIPHER_CTX_free(n->stream_enc);
-  EVP_CIPHER_CTX_free(n->stream_dec);
-
-  pthread_mutex_destroy(&n->mutex);
+  if (n->encrypt) {
+      EVP_CIPHER_CTX_free(n->block_enc);
+      EVP_CIPHER_CTX_free(n->block_dec);
+      EVP_CIPHER_CTX_free(n->stream_enc);
+      EVP_CIPHER_CTX_free(n->stream_dec);
+      
+      pthread_mutex_destroy(&n->mutex);
+      if (n->cache.data)      
+          free (n->cache.data);
+  }
   
   free (n);
 }
+
 
 static void
 inode_free (void *p)
@@ -1916,6 +1937,34 @@ make_whiteout_node (const char *path, const char *name)
   return ret_xchg;
 }
 
+static struct ovl_node *
+make_basefs_node (const char *path, const char *name)
+{
+  cleanup_node_init struct ovl_node *ret = NULL;
+  struct ovl_node *ret_xchg;
+  char *new_name;
+
+  ret = calloc (1, sizeof (*ret));
+  if (ret == NULL)
+    return NULL;
+
+  new_name = strdup (name);
+  if (new_name == NULL)
+    return NULL;
+
+  node_set_name (ret, new_name);
+
+  ret->path = strdup (path);
+  if (ret->path == NULL)
+    return NULL;
+
+  ret_xchg = ret;
+  ret = NULL;
+
+  stats.nodes++;
+  return ret_xchg;
+}
+
 static ssize_t
 safe_read_xattr (char **ret, int sfd, const char *name, size_t initial_size)
 {
@@ -1999,6 +2048,7 @@ void initCipherCtx(struct ovl_node *node)
     memset(node->cache.data, 0, gBlockSize);
 
     pthread_mutex_unlock(&node->mutex);
+    node->encrypt = 1;
 }
 
 
@@ -2224,12 +2274,7 @@ get_whiteout_name (const char *name, struct stat *st)
   return NULL;
 }
 
-void removeFirstChar(char *str) {
-    if (str != NULL && str[0] != '\0') {
-        memmove(str, str + 1, strlen(str + 1) + 1);
-    }
-}
-
+/*
 static int hide_lowlayer_path(char *path, char *name, char *home)
 {
     int i = 0;
@@ -2273,6 +2318,357 @@ static int hide_lowlayer_path(char *path, char *name, char *home)
 
     return 0;
 }
+*/
+char *line_remove_spaces(const char *buf) {
+    size_t len = strlen(buf);
+    if (len == 0)
+        return NULL;
+
+    // allocate memory for the new string
+    char *rv = malloc(len + 1);
+    if (rv == NULL)
+        return NULL;
+
+    // remove space at start of line
+    const char *ptr1 = buf;
+    while (*ptr1 == ' ' || *ptr1 == '\t')
+        ptr1++;
+
+    // copy data and remove additional spaces
+    char *ptr2 = rv;
+    int state = 0;
+    while (*ptr1 != '\0') {
+        if (*ptr1 == '\n' || *ptr1 == '\r')
+            break;
+
+        if (state == 0) {
+            if (*ptr1 != ' ' && *ptr1 != '\t')
+                *ptr2++ = *ptr1++;
+            else {
+                *ptr2++ = ' ';
+                ptr1++;
+                state = 1;
+            }
+        }
+        else {  // state == 1
+            while (*ptr1 == ' ' || *ptr1 == '\t')
+                ptr1++;
+            state = 0;
+        }
+    }
+
+    if (ptr2 > rv && *(ptr2 - 1) == ' ')
+        --ptr2;
+    *ptr2 = '\0';
+
+    return rv;
+}
+
+char *gnu_basename(char *path) {
+    char *last_slash = strrchr(path, '/');
+    if (!last_slash)
+        return path;
+    return last_slash+1;
+}
+
+void profile_add_list(char *str, ProfileEntry **list) {
+    ProfileEntry *prf = malloc(sizeof(ProfileEntry));
+    if (!prf) {
+        printf("prf is NULL\n");
+        return;
+    }
+    memset(prf, 0, sizeof(ProfileEntry));
+    prf->next = NULL;
+    prf->data = str;
+
+    if (*list == NULL) {
+        *list = prf;
+        return;
+    }
+    ProfileEntry *ptr = *list;
+    while (ptr->next != NULL)
+        ptr = ptr->next;
+    ptr->next = prf;
+}
+
+void profile_add_globlist(char *str, ProfileEntry **list) {
+    size_t i;
+    glob_t globbuf;
+    char *path = NULL;
+
+    int globerr = glob(str, GLOB_NOCHECK | GLOB_NOSORT | GLOB_PERIOD, NULL, &globbuf);
+    if (globerr) {
+        printf("Error: failed to glob pattern %s\n", str);
+        return;
+    }
+
+    for (i = 0; i < globbuf.gl_pathc; i++) {
+        path = globbuf.gl_pathv[i];
+        //printf("path: %s\n", path);
+
+        const char *base = gnu_basename(path);
+        if (strcmp(base, ".") == 0 || strcmp(base, "..") == 0)
+            continue;
+
+        profile_add_list(strdup(path), list);
+    }
+
+    globfree(&globbuf);
+}
+
+void profile_mergelist(ProfileEntry **includelist, ProfileEntry **excludelist, ProfileEntry **mergelist) {
+    ProfileEntry *includeentry;
+    ProfileEntry *excludeentry;
+    int mergeflag = 1;
+
+    includeentry = *includelist;
+    while (includeentry) {
+        mergeflag = 1;
+        excludeentry = *excludelist;
+        while (excludeentry) {
+            if (strcmp(includeentry->data, excludeentry->data) == 0) {
+                mergeflag = 0;
+                break;
+            }
+
+            excludeentry = excludeentry->next;
+        }
+
+        if(mergeflag) {
+            profile_add_list(includeentry->data, mergelist);
+        }
+        includeentry = includeentry->next;
+    }
+
+}
+
+char *expand_macros(char *path) {
+    char *new_name = NULL;
+
+    char *uid = getenv("PKEXEC_UID");
+    struct passwd *pw = getpwuid(atoi(uid));
+
+    if (strncmp(path, "$HOME", 5) == 0) {
+        printf("Error: $HOME is not allowed in profile files, please replace it with ${HOME}\n");
+        return NULL;
+    }
+    else if (strncmp(path, "${HOME}", 7) == 0) {
+        asprintf(&new_name, "%s%s", pw->pw_dir, path + 7);
+        return new_name;
+    }
+    else if (*path == '~') {
+        asprintf(&new_name, "%s%s", pw->pw_dir, path + 1);
+        return new_name;
+    }
+
+    return strdup(path);
+}
+
+void parse_mergelist() {
+    char buf[MAX_READ + 1];
+    int lineno = 0;
+    ProfileEntry *entry;
+    char *ptr = NULL;
+    char *new_name = NULL;
+
+    FILE *fp = fopen("/home/jailbox/profile.config", "r");
+    if (fp == NULL) {
+        syslog(LOG_INFO,"Error: cannot open profile file %s\n", "profile.config");
+        return;
+    }
+
+    while (fgets(buf, MAX_READ, fp)) {
+        ++lineno;
+        
+        ptr = line_remove_spaces(buf);
+        if (ptr == NULL)
+            continue;
+        
+        if (*ptr == '#' || *ptr == '\0') {
+            free(ptr);
+            continue;
+        }
+
+        if (strncmp(ptr, "whitelist ", 10) == 0) {
+            new_name = expand_macros(ptr+10);
+            if (new_name) {
+                profile_add_globlist(new_name, &whitelist);
+            }
+        } else if (strncmp(ptr, "nowhitelist ", 12) == 0) {
+            new_name = expand_macros(ptr+12);
+            if (new_name) {
+                profile_add_globlist(new_name, &nowhitelist);
+            }
+        } else if (strncmp(ptr, "blacklist ", 10) == 0) {
+            new_name = expand_macros(ptr+10);
+            if (new_name) {
+                profile_add_globlist(new_name, &blacklist);
+            }
+        }
+        if (new_name)
+            free(new_name);
+    }
+
+    fclose(fp);
+
+    profile_mergelist(&whitelist, &nowhitelist, &mergewhitelist);
+    profile_mergelist(&blacklist, &mergewhitelist, &mergelist);
+
+    syslog(LOG_INFO, "mergelist----------------------\n");
+    entry = mergelist;
+    while (entry) {
+        syslog(LOG_INFO, "mergelist %s\n", entry->data);
+        entry = entry->next;
+    }
+}
+
+int ends_suffix(const char *str, const char *suffix) {
+    int str_len = strlen(str);
+    int suffix_len = strlen(suffix);
+
+    // 如果字符串比后缀短，则返回0
+    if (str_len < suffix_len) {
+        return 0;
+    }
+
+    // 将字符串指针移到字符串的结尾处，然后逐个字符比较
+    str += (str_len - suffix_len);
+    while (*str && *suffix) {
+        if (*str != *suffix) {
+            return 0;
+        }
+        str++;
+        suffix++;
+    }
+
+    // 如果后缀字符串已经遍历完了，说明匹配成功
+    return *suffix == '\0';
+}
+
+static bool is_regular_file(char *path)
+{
+    struct stat st;
+    
+	if (stat(path, &st) == 0) {
+        return S_ISREG(st.st_mode); 
+	} else {
+        return 0;
+	}
+}
+
+
+static int hide_lowlayer_path(char *path, char *name)
+{
+    int len = 0;
+    ProfileEntry *entry = NULL;
+    char *base = NULL;
+    char *dir = NULL;
+    char *item = NULL;
+    struct ovl_node key;
+    struct ovl_node *child = NULL;
+    char full_path[PATH_MAX];
+
+    entry = mergelist;
+    while (entry) {
+        len = strlen(entry->data);
+        if (entry->data[len-1] == '/') {
+            if (0 == strncmp(path, entry->data+1, len-2)) {
+                syslog(LOG_INFO, "hide_lowlayer_path path=%s name=%s\n", path, name);
+                return 1;
+            }
+        } else {
+            item = strdup(entry->data);
+            dir = dirname(item);
+            base = gnu_basename(entry->data);
+            if (0 == strcmp(path, dir+1) && 0 == strcmp(name, base)) {
+                free(item);
+                syslog(LOG_INFO, "hide_lowlayer_path path=%s name=%s\n", path, name);
+                return 1;
+            }
+            free(item);
+        }
+
+        entry = entry->next;
+    }
+
+    /*basefs check*/
+    if (strcmp(path, ".") == 0) {
+        snprintf(full_path, PATH_MAX, "/%s", name);
+    } else {
+        snprintf(full_path, PATH_MAX, "/%s/%s", path, name);
+    }
+    node_set_name (&key, full_path);
+    child = hash_lookup (g_basefs_root->children, &key);
+    if (child)
+    {
+        return 0;
+    }
+
+    if (strncmp(full_path, "/home", strlen("/home")) == 0) {
+        return 0;
+    }
+
+    if (strcmp(full_path, "/usr/share/glib-2.0/schemas/gschemas.compiled") == 0) {
+        return 0;
+    }
+
+    if (strcmp(full_path, "/usr/lib/locale/locale-archive") == 0) {
+        return 0;
+    }
+
+    if (strncmp(full_path, "/usr/share", strlen("/usr/share")) == 0) {
+        if (strncmp(full_path, "/usr/share/mime", strlen("/usr/share/mime")) == 0) {
+            if (strcmp(name, "aliases") == 0
+                || strcmp(name, "generic-icons") == 0                
+                || strcmp(name, "globs") == 0                
+                || strcmp(name, "globs") == 0
+                || strcmp(name, "globs2") == 0            
+                || strcmp(name, "icons") == 0
+                || strcmp(name, "magic") == 0
+                || strcmp(name, "mime.cache") == 0
+                || strcmp(name, "subclasses") == 0
+                || strcmp(name, "treemagic") == 0
+                || strcmp(name, "types") == 0
+                || strcmp(name, "version") == 0
+                || strcmp(name, "XMLnamespaces") == 0) {
+                return 0;
+            }
+            if (!is_regular_file(full_path)) {
+                return 0;
+            }
+            
+            if (ends_suffix(name, ".xml")) {
+                return 0;
+            }
+        }
+
+        /*
+        /usr/share/fonts/X11/Type1/encodings.dir
+        /usr/share/fonts/X11/Type1/fonts.dir
+        /usr/share/fonts/X11/Type1/fonts.scale
+        /usr/share/fonts/X11/misc/encodings.dir
+        /usr/share/fonts/X11/misc/fonts.alias
+        /usr/share/fonts/X11/misc/fonts.dir
+
+        
+        */
+        if (ends_suffix(name, ".pyc") || ends_suffix(name, "__pycache__")
+            || ends_suffix(name, ".cache")) {
+            return 0;
+        }
+        //return 0;
+    }
+
+    if (strncmp(full_path, "/usr/lib/x86_64-linux-gnu/", strlen("/usr/lib/x86_64-linux-gnu/")) == 0) {
+        if (ends_suffix(name, ".pyc") || ends_suffix(name, "__pycache__")
+            || ends_suffix(name, ".cache")) {
+            return 0;
+        }
+    }
+
+    syslog(LOG_INFO, "hide_lowlayer_path of basefs fullpath=%s\n", full_path);
+    return 1;
+}
 
 static struct ovl_node *
 load_dir (struct ovl_data *lo, struct ovl_node *n, struct ovl_layer *layer, char *path, char *name)
@@ -2281,11 +2677,6 @@ load_dir (struct ovl_data *lo, struct ovl_node *n, struct ovl_layer *layer, char
   bool stop_lookup = false;
   struct ovl_layer *it, *lower_layer = get_lower_layers(lo), *upper_layer = get_upper_layer (lo);
   char parent_whiteout_path[PATH_MAX];
-  char *uid = getenv("PKEXEC_UID");
-
-  struct passwd *pw = getpwuid(atoi(uid));
-
-  syslog(LOG_INFO, "home=%s uid=%d euid=%d\n", pw->pw_dir, getuid(), geteuid());
 
   if (!n)
     {
@@ -2349,7 +2740,7 @@ load_dir (struct ovl_data *lo, struct ovl_node *n, struct ovl_layer *layer, char
           if ((strcmp (dent->d_name, ".") == 0) || strcmp (dent->d_name, "..") == 0)
             continue;
 
-          if (it == lower_layer && hide_lowlayer_path(path, dent->d_name, pw->pw_dir+1))
+          if (it == lower_layer && hide_lowlayer_path(path, dent->d_name))
           {
               continue;
           }
@@ -7441,6 +7832,91 @@ static void  parent_exit_watch()
     pthread_detach(tid);
 }
 
+static void basefs_root_init()
+{
+    g_basefs_root = make_basefs_node ("/", "/");
+    if (g_basefs_root == NULL) {
+        error (EXIT_FAILURE, 0, "error basefs_root init");
+    }
+    
+    g_basefs_root->children = hash_initialize (1<<17, NULL, node_hasher, node_compare, node_free);
+    if (g_basefs_root->children == NULL) {
+        error (EXIT_FAILURE, 0, "error basefs_root children init");
+    }
+}
+
+static void load_detail_item(char *path) {
+    char buf[MAX_READ + 1];
+    int lineno = 0;
+    struct ovl_node *node;
+    char *ptr = NULL;
+    char *new_name = NULL;
+
+    if (path == NULL) {
+        return;
+    }
+
+    FILE *fp = fopen(path, "r");
+    if (fp == NULL) {
+        syslog(LOG_INFO,"Error: cannot open profile file %s\n", path);
+        return;
+    }
+
+    while (fgets(buf, MAX_READ, fp)) {
+        ++lineno;
+        
+        ptr = line_remove_spaces(buf);
+        if (ptr == NULL)
+            continue;
+        
+        if (*ptr == '#' || *ptr == '\0') {
+            free(ptr);
+            continue;
+        }
+
+        node = make_basefs_node ("", ptr);
+        if (node == NULL)
+        {
+            continue;
+        }
+
+        node = insert_node (g_basefs_root, node, false);
+        if (node == NULL)
+        {
+            continue;
+        }
+    }
+    
+    fclose(fp);
+}
+
+
+static void basefs_init()
+{
+    DIR *dir;
+    struct dirent *entry;
+    char full_path[PATH_MAX];
+
+    basefs_root_init();
+
+    // 打开当前工作目录
+    if ((dir = opendir(BASE_FILE_PATH)) == NULL) {
+        error (EXIT_FAILURE, 0, "failed to load basefs");
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (ends_suffix(entry->d_name, ".list")) {
+            snprintf(full_path, PATH_MAX, "%s%s", BASE_FILE_PATH, entry->d_name);
+            load_detail_item(full_path);
+        }
+    }
+
+    closedir(dir); // 关闭目录
+
+    return;
+}
+
+
 int main (int argc, char *argv[])
 {
   unsigned char password[] = "darkforest";
@@ -7482,7 +7958,9 @@ int main (int argc, char *argv[])
 
   newAESCipher(gKeyLen);
   newKey(password, strlen(password), gSSLCipher.keySize, gSSLCipher.ivLength);
-  
+  parse_mergelist();
+  basefs_init();
+
   memset (&opts, 0, sizeof (opts));
   if (fuse_opt_parse (&args, &lo, ovl_opts, fuse_opt_proc) == -1)
     error (EXIT_FAILURE, 0, "error parsing options");

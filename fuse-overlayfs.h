@@ -96,6 +96,7 @@ struct ovl_node
   unsigned int hidden : 1;
   unsigned int whiteout : 1;
   unsigned int loaded : 1;
+  unsigned int encrypt : 1;
 };
 
 struct ovl_mapping
