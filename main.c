@@ -1219,6 +1219,11 @@ int isInBox(fuse_req_t req, pid_t accessPid)
             return true;
         }
 
+	if(strncmp(procName, "QThread", strlen("QThread"))==0)
+        {
+            return true;
+        }
+
         if(strncmp(procName, "StreamTran", strlen("StreamTran"))==0)
         {
             return true;
