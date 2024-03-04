@@ -68,6 +68,7 @@
 #include <libgen.h>
 #include <glob.h>
 #include <pwd.h>
+#include <ctype.h>
 
   // OpenSSL < 1.1.0 or LibreSSL
 #if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
@@ -1122,6 +1123,37 @@ char *pid_proc_comm(const pid_t pid) {
 	return rv;
 }
 
+pid_t get_process_id_from_thread_id(pid_t tid) {
+    DIR *dir;
+    struct dirent *entry;
+    char buf[256];
+    struct stat st;
+
+    // 打开/proc目录
+    if ((dir = opendir("/proc")) == NULL) {
+	    return -1;
+    }
+
+    // 遍历/proc目录下的进程子目录
+    while ((entry = readdir(dir)) != NULL) {
+        // 过滤掉非数字目录（不是进程ID）
+        if (entry->d_type != DT_DIR || !isdigit(*entry->d_name))
+            continue;
+	
+        // 构建进程的task目录路径
+        snprintf(buf, sizeof(buf), "/proc/%s/task/%d", entry->d_name, tid);
+
+	    if(stat(buf, &st) == 0)
+        {
+	        closedir(dir);
+            return atoi(entry->d_name);
+        }
+    }
+    closedir(dir);
+
+    // 没有找到对应的进程ID
+    return -1;
+}
 
 int isInBox(fuse_req_t req, pid_t accessPid)
 {
@@ -1130,7 +1162,7 @@ int isInBox(fuse_req_t req, pid_t accessPid)
     char procName[MAX_PATH_STR]={0};
     char accessprocName[MAX_PATH_STR]={0};
     char accessprocMntNs[128]={0};
-    pid_t pid =accessPid;
+    pid_t pid = accessPid;
     pid_t fpid = 0;
     struct stat st;
     ssize_t ret = 0;
@@ -1157,6 +1189,14 @@ int isInBox(fuse_req_t req, pid_t accessPid)
         return true;
     }
 
+    //根据线程id获取进程id
+    pid = get_process_id_from_thread_id(accessPid);
+
+    if (pid == -1) {        
+        syslog(LOG_INFO, "failed get processid by id[%d]\n", accessPid);
+        return false;
+    }
+
     while(1)
     {
         //idle
@@ -1174,7 +1214,7 @@ int isInBox(fuse_req_t req, pid_t accessPid)
             return false;
         }
         //kthreadd
-        if(pid==2)
+        if(pid == 2)
         {
             if (UNLIKELY (ovl_debug (req)))
 	    {
@@ -1183,7 +1223,7 @@ int isInBox(fuse_req_t req, pid_t accessPid)
             return true;
         }
 
-        if(pid==gManagePid)
+        if(pid == gManagePid)
         {
             //syslog(LOG_INFO, "pid=%d, gManagePid=%d\n", pid, gManagePid);
             return true;
@@ -1219,39 +1259,6 @@ int isInBox(fuse_req_t req, pid_t accessPid)
             return true;
         }
 
-	if(strncmp(procName, "QThread", strlen("QThread"))==0)
-        {
-            return true;
-        }
-
-        if(strncmp(procName, "StreamTran", strlen("StreamTran"))==0)
-        {
-            return true;
-        }
-
-        if(strncmp(procName, "BgIOThr~Poo", strlen("BgIOThr~Poo"))==0)
-        {
-            return true;
-        }
-        
-
-        if(strncmp(procName, "TaskCon~lle", strlen("TaskCon~lle"))==0)
-        {
-            return true;
-
-        }
-
-        if(strncmp(procName, "apport", strlen("apport"))==0)
-        {
-            return true;
-
-        }
-
-        if(strncmp(procName, "Backgro~Poo", strlen("Backgro~Poo"))==0)
-        {
-            return true;
-
-        }
         pid = fpid;
         memset(statPath,0,strlen(statPath));
         memset(buf,0,strlen(buf));
