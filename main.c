@@ -2458,6 +2458,11 @@ char *expand_macros(char *path) {
     char *new_name = NULL;
 
     char *uid = getenv("PKEXEC_UID");
+    if (uid == NULL) {        
+        uid = getenv("BOX_UID");
+        if (uid == NULL)
+            return NULL;
+    }
     struct passwd *pw = getpwuid(atoi(uid));
 
     if (strncmp(path, "$HOME", 5) == 0) {
