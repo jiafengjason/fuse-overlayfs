@@ -1185,7 +1185,8 @@ int isInBox(fuse_req_t req, pid_t accessPid)
 		return true;
 	}
     } else {
-        syslog(LOG_INFO, "failed get accessprocName, id=%d\n", accessPid);
+        if (UNLIKELY (ovl_debug (req)))
+            syslog(LOG_INFO, "failed get accessprocName, id=%d\n", accessPid);
         return true;
     }
 
@@ -1193,7 +1194,8 @@ int isInBox(fuse_req_t req, pid_t accessPid)
     pid = get_process_id_from_thread_id(accessPid);
 
     if (pid == -1) {        
-        syslog(LOG_INFO, "failed get processid by id[%d]\n", accessPid);
+        if (UNLIKELY (ovl_debug (req)))
+            syslog(LOG_INFO, "failed get processid by id[%d]\n", accessPid);
         return false;
     }
 
@@ -1231,8 +1233,9 @@ int isInBox(fuse_req_t req, pid_t accessPid)
 
         sprintf(statPath,"/proc/%d/stat",pid);
         if(stat(statPath,&st)!=0)
-        {
-            syslog(LOG_INFO, "stat fail:%s\n", statPath);
+        {            
+            if (UNLIKELY (ovl_debug (req)))
+                syslog(LOG_INFO, "stat fail:%s\n", statPath);
             return false;
         }
 
@@ -1288,9 +1291,12 @@ static int checkAuthority(fuse_req_t req, fuse_ino_t ino)
 
     flag = isInBox(req, req->ctx.pid);
     if(!flag)
-    {
-        fprintf (stderr, "checkAuthority deny!\n");
-        syslog(LOG_INFO, "checkAuthority deny!\n");
+    {        
+        if (UNLIKELY (ovl_debug (req)))
+        {
+            fprintf (stderr, "checkAuthority deny!\n");
+            syslog(LOG_INFO, "checkAuthority deny!\n");
+        }
     }
     //flag = true;
     return flag;
@@ -2574,7 +2580,7 @@ static bool is_regular_file(char *path)
 }
 
 
-static int hide_lowlayer_path(char *path, char *name)
+static int hide_lowlayer_path(char *path, char *name, bool debug)
 {
     int len = 0;
     ProfileEntry *entry = NULL;
@@ -2590,7 +2596,9 @@ static int hide_lowlayer_path(char *path, char *name)
         len = strlen(entry->data);
         if (entry->data[len-1] == '/') {
             if (0 == strncmp(path, entry->data+1, len-2)) {
-                syslog(LOG_INFO, "hide_lowlayer_path path=%s name=%s\n", path, name);
+                if (debug) {
+                    syslog(LOG_INFO, "hide_lowlayer_path path=%s name=%s\n", path, name);
+                }
                 return 1;
             }
         } else {
@@ -2599,7 +2607,9 @@ static int hide_lowlayer_path(char *path, char *name)
             base = gnu_basename(entry->data);
             if (0 == strcmp(path, dir+1) && 0 == strcmp(name, base)) {
                 free(item);
-                syslog(LOG_INFO, "hide_lowlayer_path path=%s name=%s\n", path, name);
+                if (debug) {
+                    syslog(LOG_INFO, "hide_lowlayer_path path=%s name=%s\n", path, name);
+                }
                 return 1;
             }
             free(item);
@@ -2682,8 +2692,10 @@ static int hide_lowlayer_path(char *path, char *name)
             return 0;
         }
     }
-
-    syslog(LOG_INFO, "hide_lowlayer_path of basefs fullpath=%s\n", full_path);
+    
+    if (debug) {
+        syslog(LOG_INFO, "hide_lowlayer_path of basefs fullpath=%s\n", full_path);
+    }
     return 1;
 }
 
@@ -2757,7 +2769,7 @@ load_dir (struct ovl_data *lo, struct ovl_node *n, struct ovl_layer *layer, char
           if ((strcmp (dent->d_name, ".") == 0) || strcmp (dent->d_name, "..") == 0)
             continue;
 
-          if (it == lower_layer && hide_lowlayer_path(path, dent->d_name))
+          if (it == lower_layer && hide_lowlayer_path(path, dent->d_name, (lo->debug != 0)))
           {
               continue;
           }
@@ -7820,8 +7832,6 @@ static void *watch_thread(void *arg)
             _exit(1);
         }
 
-        syslog(LOG_INFO, "watch thread loop ppid = %d, get ppid = %d\n", ppid, getppid());
-
         sleep(1);
     }
 }
@@ -7936,7 +7946,8 @@ static void basefs_init()
 
 int main (int argc, char *argv[])
 {
-  unsigned char password[] = "darkforest";
+  char *password = "darkforest";
+  char *box_session = NULL;
   struct fuse_session *se = NULL;
   struct fuse_cmdline_opts opts;
   char **newargv = get_new_args (&argc, argv);
@@ -7974,6 +7985,10 @@ int main (int argc, char *argv[])
   pid_mnt_ns(getpid(), gMntNs, 128);
 
   newAESCipher(gKeyLen);
+  box_session = getenv("BOX_SESSION");
+  if (box_session != NULL) {
+      password = strdup(box_session);  
+  }
   newKey(password, strlen(password), gSSLCipher.keySize, gSSLCipher.ivLength);
   parse_mergelist();
   basefs_init();
