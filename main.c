@@ -132,6 +132,13 @@ typedef struct profile_entry_t {
     char *data;
 } ProfileEntry;
 
+
+typedef struct box_decison{        
+    pid_t pid;
+    bool decison;
+}box_decison_t;
+
+
 ProfileEntry *whitelist;
 ProfileEntry *nowhitelist;
 ProfileEntry *blacklist;
@@ -1278,6 +1285,8 @@ static int checkAuthority(fuse_req_t req, fuse_ino_t ino)
     int fpid = 0;
     bool flag = false;
 
+    static box_decison_t cache_dicison = {-1, false};
+
     if (UNLIKELY (ovl_debug (req)))
     {
         fprintf (stderr, "checkAuthority(pid=%d gManagePid=%d)\n", req->ctx.pid, gManagePid);
@@ -1288,6 +1297,9 @@ static int checkAuthority(fuse_req_t req, fuse_ino_t ino)
         return true;
     }
 
+    if (cache_dicison.pid == req->ctx.pid) {
+        return cache_dicison.decison;
+    }
 
     flag = isInBox(req, req->ctx.pid);
     if(!flag)
@@ -1299,6 +1311,8 @@ static int checkAuthority(fuse_req_t req, fuse_ino_t ino)
         }
     }
     //flag = true;
+    cache_dicison.pid = req->ctx.pid;
+    cache_dicison.decison = flag;
     return flag;
 }
 
