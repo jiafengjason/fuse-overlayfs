@@ -1309,10 +1309,10 @@ static int checkAuthority(fuse_req_t req, fuse_ino_t ino)
             fprintf (stderr, "checkAuthority deny!\n");
             syslog(LOG_INFO, "checkAuthority deny!\n");
         }
+    } else {
+        cache_dicison.pid = req->ctx.pid;
+        cache_dicison.decison = flag;
     }
-    //flag = true;
-    cache_dicison.pid = req->ctx.pid;
-    cache_dicison.decison = flag;
     return flag;
 }
 
@@ -8075,6 +8075,7 @@ int main (int argc, char *argv[])
       fprintf (stderr, "mountpoint=%s\n", lo.mountpoint);
       fprintf (stderr, "plugins=%s\n", lo.plugins ? lo.plugins : "<none>");
       fprintf (stderr, "fsync=%s\n", lo.fsync ? "enabled" : "disabled");
+      fprintf (stderr, "thread=%s\n", lo.threaded ? "enabled" : "disabled");
     }
 
   lo.uid_mappings = lo.uid_str ? read_mappings (lo.uid_str) : NULL;
