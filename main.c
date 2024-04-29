@@ -2306,51 +2306,7 @@ get_whiteout_name (const char *name, struct stat *st)
   return NULL;
 }
 
-/*
-static int hide_lowlayer_path(char *path, char *name, char *home)
-{
-    int i = 0;
-    int len = 0;
-    char hide_path[1024] = {0};
-    char special_paths[][32] = {
-        "Desktop",
-        "Documents",
-        "Downloads",
-        "Music",
-        "Pictures",
-        "Public",
-        "Templates",
-        "Videos"
-    };
 
-    if (0 == strncmp(path, home, strlen(home))) {
-        if (0 == strcmp(name, ".Xauthority")) {
-            return 1;
-        }
-        if (0 == strncmp(name, ".", strlen("."))) {
-            return 0;
-        }
-        for (i = 0; i<sizeof(special_paths)/32; i++) {
-            if (0 == strncmp(name, special_paths[i], strlen(special_paths[i]))) {
-                return 0;
-            }
-        }
-        syslog(LOG_INFO, "hide_lowlayer_path path=%s name=%s\n", path, name);
-        return 1;
-    }
-
-    for (i = 0; i<sizeof(special_paths)/32; i++) {
-        snprintf(hide_path, sizeof(hide_path), "%s/%s", home, special_paths[i]);
-        if (0 == strncmp(path, hide_path, strlen(hide_path))) {
-            syslog(LOG_INFO, "hide_lowlayer_path path=%s name=%s\n", path, name);
-            return 1;
-        }
-        memset(hide_path, 0, sizeof(hide_path));
-    }
-
-    return 0;
-}
-*/
 char *line_remove_spaces(const char *buf) {
     size_t len = strlen(buf);
     if (len == 0)
@@ -2601,9 +2557,10 @@ static int hide_lowlayer_path(char *path, char *name, bool debug)
     char *base = NULL;
     char *dir = NULL;
     char *item = NULL;
+    char *os = getenv("DESKTOP_SESSION");
     struct ovl_node key;
     struct ovl_node *child = NULL;
-    char full_path[PATH_MAX];
+    char full_path[PATH_MAX] = {0};
 
     entry = mergelist;
     while (entry) {
@@ -2638,8 +2595,34 @@ static int hide_lowlayer_path(char *path, char *name, bool debug)
     } else {
         snprintf(full_path, PATH_MAX, "/%s/%s", path, name);
     }
-    node_set_name (&key, full_path);
-    child = hash_lookup (g_basefs_root->children, &key);
+    
+    //统信/usr/bin /usr/lib等softlink需要放行
+    if (os != NULL && 0 == strncmp(os, "deepin", strlen("deepin")))
+    {
+        if (strncmp(full_path, "/usr/bin", strlen("/usr/bin")) == 0
+            || strncmp(full_path, "/usr/lib", strlen("/usr/lib")) == 0 
+            || strncmp(full_path, "/usr/lib32", strlen("/usr/lib32")) == 0
+            || strncmp(full_path, "/usr/lib64", strlen("/usr/lib64")) == 0
+            || strncmp(full_path, "/usr/libx32", strlen("/usr/libx32")) == 0) 
+        {
+        
+            char full_path_softlink[PATH_MAX] = {0};
+            strncpy(full_path_softlink, full_path+strlen("/usr"), PATH_MAX-1);
+            node_set_name (&key, full_path_softlink);
+            child = hash_lookup (g_basefs_root->children, &key);
+        }
+        else
+        {
+            node_set_name (&key, full_path);
+            child = hash_lookup (g_basefs_root->children, &key);
+        }
+    }
+    else
+    {
+        node_set_name (&key, full_path);
+        child = hash_lookup (g_basefs_root->children, &key);
+    }
+
     if (child)
     {
         return 0;
@@ -2647,6 +2630,13 @@ static int hide_lowlayer_path(char *path, char *name, bool debug)
 
     if (strncmp(full_path, "/home", strlen("/home")) == 0) {
         return 0;
+    }
+
+    if (os != NULL && 0 == strncmp(os, "deepin", strlen("deepin")))
+    {
+        if (strncmp(full_path, "/run/user", strlen("/run/user")) == 0) {
+            return 0;
+        }
     }
 
     if (strcmp(full_path, "/usr/share/glib-2.0/schemas/gschemas.compiled") == 0) {
