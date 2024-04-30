@@ -2595,6 +2595,14 @@ static int hide_lowlayer_path(char *path, char *name, bool debug)
     } else {
         snprintf(full_path, PATH_MAX, "/%s/%s", path, name);
     }
+
+    node_set_name (&key, full_path);
+    child = hash_lookup (g_basefs_root->children, &key);
+    
+    if (child)
+    {
+        return 0;
+    }
     
     //统信/usr/bin /usr/lib等softlink需要放行
     if (os != NULL && 0 == strncmp(os, "deepin", strlen("deepin")))
@@ -2611,23 +2619,8 @@ static int hide_lowlayer_path(char *path, char *name, bool debug)
             node_set_name (&key, full_path_softlink);
             child = hash_lookup (g_basefs_root->children, &key);
         }
-        else
-        {
-            node_set_name (&key, full_path);
-            child = hash_lookup (g_basefs_root->children, &key);
-        }
     }
-    else
-    {
-        node_set_name (&key, full_path);
-        child = hash_lookup (g_basefs_root->children, &key);
-    }
-
-    if (child)
-    {
-        return 0;
-    }
-
+    
     if (strncmp(full_path, "/home", strlen("/home")) == 0) {
         return 0;
     }
@@ -2635,6 +2628,9 @@ static int hide_lowlayer_path(char *path, char *name, bool debug)
     if (os != NULL && 0 == strncmp(os, "deepin", strlen("deepin")))
     {
         if (strncmp(full_path, "/run/user", strlen("/run/user")) == 0) {
+            return 0;
+        }
+        if (strncmp(full_path, "/etc/machine-id", strlen("/etc/machine-id")) == 0) {
             return 0;
         }
     }
