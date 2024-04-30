@@ -2618,6 +2618,10 @@ static int hide_lowlayer_path(char *path, char *name, bool debug)
             strncpy(full_path_softlink, full_path+strlen("/usr"), PATH_MAX-1);
             node_set_name (&key, full_path_softlink);
             child = hash_lookup (g_basefs_root->children, &key);
+            if (child)
+            {
+                return 0;
+            }
         }
     }
     
