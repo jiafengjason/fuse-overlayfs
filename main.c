@@ -2604,14 +2604,15 @@ static int hide_lowlayer_path(char *path, char *name, bool debug)
         return 0;
     }
     
-    //统信/usr/bin /usr/lib等softlink需要放行
-    if (os != NULL && 0 == strncmp(os, "deepin", strlen("deepin")))
+    //统信和麒麟/usr/bin /usr/lib等softlink需要放行
+    if (os != NULL && (0 == strncmp(os, "deepin", strlen("deepin")) || 0 == strncmp(os, "ukui", strlen("ukui"))))
     {
         if (strncmp(full_path, "/usr/bin", strlen("/usr/bin")) == 0
             || strncmp(full_path, "/usr/lib", strlen("/usr/lib")) == 0 
             || strncmp(full_path, "/usr/lib32", strlen("/usr/lib32")) == 0
             || strncmp(full_path, "/usr/lib64", strlen("/usr/lib64")) == 0
-            || strncmp(full_path, "/usr/libx32", strlen("/usr/libx32")) == 0) 
+            || strncmp(full_path, "/usr/libx32", strlen("/usr/libx32")) == 0
+            || strncmp(full_path, "/usr/sbin", strlen("/usr/sbin")) == 0) 
         {
         
             char full_path_softlink[PATH_MAX] = {0};
@@ -2629,7 +2630,7 @@ static int hide_lowlayer_path(char *path, char *name, bool debug)
         return 0;
     }
 
-    if (os != NULL && 0 == strncmp(os, "deepin", strlen("deepin")))
+    if (os != NULL && (0 == strncmp(os, "deepin", strlen("deepin")) || 0 == strncmp(os, "ukui", strlen("ukui"))))
     {
         if (strncmp(full_path, "/run/user", strlen("/run/user")) == 0) {
             return 0;
