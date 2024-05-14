@@ -10,7 +10,7 @@ AM_CPPFLAGS = -DPKGLIBEXECDIR='"$(pkglibexecdir)"'
 
 fuse_overlayfs_CFLAGS = -I . -I $(abs_srcdir)/lib $(FUSE_CFLAGS)
 fuse_overlayfs_LDFLAGS =
-fuse_overlayfs_LDADD = lib/libgnu.a $(FUSE_LIBS) -lcrypto
+fuse_overlayfs_LDADD = lib/libgnu.a $(FUSE_LIBS) -lcrypto -lmagic
 fuse_overlayfs_SOURCES = main.c direct.c utils.c plugin-manager.c
 
 WD := $(shell pwd)
