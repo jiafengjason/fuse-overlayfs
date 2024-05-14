@@ -10,7 +10,7 @@ AM_CPPFLAGS = -DPKGLIBEXECDIR='"$(pkglibexecdir)"'
 
 fuse_overlayfs_CFLAGS = -I . -I $(abs_srcdir)/lib -I ../tassl/include $(FUSE_CFLAGS)
 fuse_overlayfs_LDFLAGS =
-fuse_overlayfs_LDADD = lib/libgnu.a ../tassl/lib/libcrypto.a $(FUSE_LIBS)
+fuse_overlayfs_LDADD = lib/libgnu.a ../tassl/lib/libcrypto.a $(FUSE_LIBS) -lmagic
 fuse_overlayfs_SOURCES = main.c direct.c utils.c plugin-manager.c
 
 WD := $(shell pwd)

@@ -69,6 +69,7 @@
 #include <glob.h>
 #include <pwd.h>
 #include <ctype.h>
+#include <magic.h>
 
 #ifndef TEMP_FAILURE_RETRY
 #define TEMP_FAILURE_RETRY(expression) \
@@ -2523,6 +2524,49 @@ static bool is_regular_file(char *path)
 	}
 }
 
+static bool magic_file_pass(const char* path, bool debug)
+{
+    const char* mgc_file = "./magic.mgc";
+    char* pch = NULL;
+    bool bret = false;
+    magic_t ctx = magic_open(MAGIC_MIME);
+    if (NULL == ctx)
+    {
+        syslog(LOG_INFO, "magic_file_pass magic_open failed\n");
+        goto _out;
+    }
+    if (magic_load(ctx, mgc_file) != 0)
+    {
+        syslog(LOG_INFO, "magic_file_pass magic_load %s failed.\n", mgc_file);
+        goto _out;
+    }
+    const char* mime_desc = magic_file(ctx, path);
+    if(NULL == mime_desc)
+    {
+        syslog(LOG_INFO, "magic_file_pass magic_file %s failed.\n", path);
+        goto _out;
+    }
+    if(strstr(mime_desc, "application/x-archive")
+        || strstr(mime_desc, "application/x-sharedlib")
+        || strstr(mime_desc, "application/x-executable")
+        || strstr(mime_desc, "application/x-shared-library-la")
+        || strstr(mime_desc, "inode/symlink"))
+    {
+        bret = true;
+        if(debug)
+        {
+            syslog(LOG_INFO, "magic_file_pass  path=%s\n", path);
+        }
+    }
+
+_out:
+   if (ctx != NULL)
+   {
+        magic_close(ctx);
+        ctx = NULL;
+   }
+   return bret;
+}
 
 static int hide_lowlayer_path(char *path, char *name, bool debug)
 {
@@ -2662,7 +2706,6 @@ static int hide_lowlayer_path(char *path, char *name, bool debug)
             || ends_suffix(name, ".cache")) {
             return 0;
         }
-        //return 0;
     }
 
     if (strncmp(full_path, "/usr/lib/x86_64-linux-gnu/", strlen("/usr/lib/x86_64-linux-gnu/")) == 0) {
@@ -2670,6 +2713,10 @@ static int hide_lowlayer_path(char *path, char *name, bool debug)
             || ends_suffix(name, ".cache")) {
             return 0;
         }
+    }
+    if(magic_file_pass(full_path, debug))
+    {
+        return 0;
     }
     
     if (debug) {
