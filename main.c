@@ -119,6 +119,7 @@ ProfileEntry *nowhitelist;
 ProfileEntry *blacklist;
 ProfileEntry *mergewhitelist;
 ProfileEntry *mergelist;
+ProfileEntry *mimelist;
 
 struct fuse_session *g_fuse_se = NULL;
 
@@ -143,6 +144,7 @@ static char gMntNs[128] = {0};
 #define MAX_PATH_STR  1024
 #define INVALID_PID -1
 #define MAX_READ 8192
+#define MAX_MIME_LEN 256
 
 #define BASE_FILE_PATH "/var/lib/dpkg/info/"
 struct ovl_node *g_basefs_root;
@@ -2432,6 +2434,23 @@ char *expand_macros(char *path) {
     return strdup(path);
 }
 
+void parse_mimelist()
+{
+    FILE *fp = fopen("/home/jailbox/mime.config", "r");
+    char line[MAX_MIME_LEN] = {0};
+    if (fp == NULL) 
+    {
+        syslog(LOG_INFO,"Error: cannot open profile file mime.conf\n");
+        return;
+    }
+    while (fgets(line, MAX_MIME_LEN, fp) != NULL) 
+    { 
+        profile_add_list(line, &mimelist);
+    }
+    fclose(fp);
+    fp = NULL;
+}
+
 void parse_mergelist() {
     char buf[MAX_READ + 1];
     int lineno = 0;
@@ -2529,6 +2548,7 @@ static bool magic_file_pass(const char* path, bool debug)
     const char* mgc_file = "./magic.mgc";
     char* pch = NULL;
     bool bret = false;
+    ProfileEntry *entry = NULL;
     magic_t ctx = magic_open(MAGIC_MIME);
     if (NULL == ctx)
     {
@@ -2546,17 +2566,19 @@ static bool magic_file_pass(const char* path, bool debug)
         syslog(LOG_INFO, "magic_file_pass magic_file %s failed.\n", path);
         goto _out;
     }
-    if(strstr(mime_desc, "application/x-archive")
-        || strstr(mime_desc, "application/x-sharedlib")
-        || strstr(mime_desc, "application/x-executable")
-        || strstr(mime_desc, "application/x-shared-library-la")
-        || strstr(mime_desc, "inode/symlink"))
+    entry = mimelist;
+    while (entry)
     {
-        bret = true;
-        if(debug)
+        if(strstr(mime_desc, entry->data))
         {
-            syslog(LOG_INFO, "magic_file_pass  path=%s\n", path);
+            bret = true;
+            if(debug)
+            {
+                syslog(LOG_INFO, "magic_file_pass  path=%s\n", path);
+            }
+            break;
         }
+        entry = entry->next;
     }
 
 _out:
