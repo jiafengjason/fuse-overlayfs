@@ -2546,7 +2546,7 @@ static bool is_regular_file(char *path)
 
 static bool magic_file_pass(const char* path, bool debug)
 {
-    const char* mgc_file = "./magic.mgc";
+    const char* mgc_file = "/home/jailbox/magic.mgc";
     char* pch = NULL;
     bool bret = false;
     ProfileEntry *entry = NULL;
