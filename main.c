@@ -2438,7 +2438,8 @@ char *expand_macros(char *path) {
 void parse_mimelist()
 {
     FILE *fp = fopen("/home/jailbox/mime.config", "r");
-    char line[MAX_MIME_LEN] = {0};
+    char line[MAX_MIME_LEN + 1] = {0};
+    char *ptr = NULL;
     if (fp == NULL) 
     {
         syslog(LOG_INFO,"Error: cannot open profile file mime.conf\n");
@@ -2446,10 +2447,22 @@ void parse_mimelist()
     }
     while (fgets(line, MAX_MIME_LEN, fp) != NULL) 
     { 
-        profile_add_list(line, &mimelist);
+        ptr = line_remove_spaces(line);
+        if(!ptr)
+        {
+            continue;
+        }
+        profile_add_list(ptr, &mimelist);
     }
     fclose(fp);
     fp = NULL;
+
+    syslog(LOG_INFO, "mimelist----------------------\n");
+    ProfileEntry *entry = mimelist;
+    while (entry) {
+        syslog(LOG_INFO, "mime %s\n", entry->data);
+        entry = entry->next;
+    }
 }
 
 void parse_mergelist() {
@@ -8040,6 +8053,7 @@ int main (int argc, char *argv[])
   }
   newKey(password, strlen(password), gSSLCipher.keySize, gSSLCipher.ivLength);
   parse_mergelist();
+  parse_mimelist();
   basefs_init();
 
   memset (&opts, 0, sizeof (opts));
