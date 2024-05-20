@@ -23,9 +23,9 @@
 # include <plugin-manager.h>
 # include <stdbool.h>
 # include <sys/types.h>
-#include <openssl/evp.h>
-#include <openssl/hmac.h>
-#include <openssl/buffer.h>
+#include "openssl/evp.h"
+#include "openssl/hmac.h"
+#include "openssl/buffer.h"
 
 typedef struct hash_table Hash_table;
 
