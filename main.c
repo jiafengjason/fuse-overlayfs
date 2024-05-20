@@ -71,6 +71,7 @@
 #include <ctype.h>
 #include <magic.h>
 
+
 #ifndef TEMP_FAILURE_RETRY
 #define TEMP_FAILURE_RETRY(expression) \
   (__extension__                                                              \
