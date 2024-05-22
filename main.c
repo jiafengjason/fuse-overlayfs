@@ -69,7 +69,7 @@
 #include <glob.h>
 #include <pwd.h>
 #include <ctype.h>
-#include <magic.h>
+#include "magic.h"
 
 
 #ifndef TEMP_FAILURE_RETRY
