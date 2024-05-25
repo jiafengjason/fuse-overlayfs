@@ -69,6 +69,8 @@
 #include <glob.h>
 #include <pwd.h>
 #include <ctype.h>
+#include "magic.h"
+
 
 #ifndef TEMP_FAILURE_RETRY
 #define TEMP_FAILURE_RETRY(expression) \
@@ -118,6 +120,7 @@ ProfileEntry *nowhitelist;
 ProfileEntry *blacklist;
 ProfileEntry *mergewhitelist;
 ProfileEntry *mergelist;
+ProfileEntry *mimelist;
 
 struct fuse_session *g_fuse_se = NULL;
 
@@ -142,6 +145,7 @@ static char gMntNs[128] = {0};
 #define MAX_PATH_STR  1024
 #define INVALID_PID -1
 #define MAX_READ 8192
+#define MAX_MIME_LEN 256
 
 #define BASE_FILE_PATH "/var/lib/dpkg/info/"
 struct ovl_node *g_basefs_root;
@@ -2431,6 +2435,36 @@ char *expand_macros(char *path) {
     return strdup(path);
 }
 
+void parse_mimelist()
+{
+    FILE *fp = fopen("/home/jailbox/mime.config", "r");
+    char line[MAX_MIME_LEN + 1] = {0};
+    char *ptr = NULL;
+    if (fp == NULL) 
+    {
+        syslog(LOG_INFO,"Error: cannot open profile file mime.conf\n");
+        return;
+    }
+    while (fgets(line, MAX_MIME_LEN, fp) != NULL) 
+    { 
+        ptr = line_remove_spaces(line);
+        if(!ptr)
+        {
+            continue;
+        }
+        profile_add_list(ptr, &mimelist);
+    }
+    fclose(fp);
+    fp = NULL;
+
+    syslog(LOG_INFO, "mimelist----------------------\n");
+    ProfileEntry *entry = mimelist;
+    while (entry) {
+        syslog(LOG_INFO, "mime %s\n", entry->data);
+        entry = entry->next;
+    }
+}
+
 void parse_mergelist() {
     char buf[MAX_READ + 1];
     int lineno = 0;
@@ -2523,6 +2557,52 @@ static bool is_regular_file(char *path)
 	}
 }
 
+static bool magic_file_pass(const char* path, bool debug)
+{
+    const char* mgc_file = "/home/jailbox/magic.mgc";
+    char* pch = NULL;
+    bool bret = false;
+    ProfileEntry *entry = NULL;
+    magic_t ctx = magic_open(MAGIC_MIME);
+    if (NULL == ctx)
+    {
+        syslog(LOG_INFO, "magic_file_pass magic_open failed\n");
+        goto _out;
+    }
+    if (magic_load(ctx, mgc_file) != 0)
+    {
+        syslog(LOG_INFO, "magic_file_pass magic_load %s failed.\n", mgc_file);
+        goto _out;
+    }
+    const char* mime_desc = magic_file(ctx, path);
+    if(NULL == mime_desc)
+    {
+        syslog(LOG_INFO, "magic_file_pass magic_file %s failed.\n", path);
+        goto _out;
+    }
+    entry = mimelist;
+    while (entry)
+    {
+        if(strstr(mime_desc, entry->data))
+        {
+            bret = true;
+            if(debug)
+            {
+                syslog(LOG_INFO, "magic_file_pass  path=%s\n", path);
+            }
+            break;
+        }
+        entry = entry->next;
+    }
+
+_out:
+   if (ctx != NULL)
+   {
+        magic_close(ctx);
+        ctx = NULL;
+   }
+   return bret;
+}
 
 static int hide_lowlayer_path(char *path, char *name, bool debug)
 {
@@ -2662,7 +2742,6 @@ static int hide_lowlayer_path(char *path, char *name, bool debug)
             || ends_suffix(name, ".cache")) {
             return 0;
         }
-        //return 0;
     }
 
     if (strncmp(full_path, "/usr/lib/x86_64-linux-gnu/", strlen("/usr/lib/x86_64-linux-gnu/")) == 0) {
@@ -2670,6 +2749,10 @@ static int hide_lowlayer_path(char *path, char *name, bool debug)
             || ends_suffix(name, ".cache")) {
             return 0;
         }
+    }
+    if(magic_file_pass(full_path, debug))
+    {
+        return 0;
     }
     
     if (debug) {
@@ -7970,6 +8053,7 @@ int main (int argc, char *argv[])
   }
   newKey(password, strlen(password), gSSLCipher.keySize, gSSLCipher.ivLength);
   parse_mergelist();
+  parse_mimelist();
   basefs_init();
 
   memset (&opts, 0, sizeof (opts));
