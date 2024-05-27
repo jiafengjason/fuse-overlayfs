@@ -2684,7 +2684,7 @@ static int hide_lowlayer_path(char *path, char *name, bool debug)
         return 0;
     }
 
-    if (os != NULL && (0 == strncmp(os, "deepin", strlen("deepin")) || 0 == strncmp(os, "ukui", strlen("ukui"))))
+    if (os != NULL && (0 == strncmp(os, "deepin", strlen("deepin")) || 0 == strncmp(os, "ukui", strlen("ukui")) || 0 == strncmp(os, "mate", strlen("mate"))))
     {
         if (strncmp(full_path, "/run/user", strlen("/run/user")) == 0) {
             return 0;
