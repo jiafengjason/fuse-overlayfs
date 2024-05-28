@@ -9,8 +9,8 @@ EXTRA_DIST = m4/gnulib-cache.m4 rpm/fuse-overlayfs.spec.template autogen.sh fuse
 AM_CPPFLAGS = -DPKGLIBEXECDIR='"$(pkglibexecdir)"'
 
 fuse_overlayfs_CFLAGS = -I . -I $(abs_srcdir)/lib -I ../tassl-1.1.1b-0.8/include -I ../magic_file/src $(FUSE_CFLAGS)
-fuse_overlayfs_LDFLAGS =
-fuse_overlayfs_LDADD = lib/libgnu.a ../tassl-1.1.1b-0.8/libcrypto.a ../magic_file/src/.libs/libmagic.a -lz $(FUSE_LIBS)
+fuse_overlayfs_LDFLAGS = -Wl,-rpath,$$ORIGIN/home/enlink/lib
+fuse_overlayfs_LDADD = lib/libgnu.a $(FUSE_LIBS) -lcrypto -lmagic
 fuse_overlayfs_SOURCES = main.c direct.c utils.c plugin-manager.c
 
 WD := $(shell pwd)
