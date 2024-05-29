@@ -10,7 +10,7 @@ AM_CPPFLAGS = -DPKGLIBEXECDIR='"$(pkglibexecdir)"'
 
 fuse_overlayfs_CFLAGS = -I . -I $(abs_srcdir)/lib -I ../tassl-1.1.1b-0.8/include -I ../magic_file/src $(FUSE_CFLAGS)
 fuse_overlayfs_LDFLAGS = -Wl,-rpath,$$ORIGIN/home/enlink/lib
-fuse_overlayfs_LDADD = lib/libgnu.a $(FUSE_LIBS) -lcrypto -lmagic
+fuse_overlayfs_LDADD = lib/libgnu.a $(FUSE_LIBS) -L../tassl-1.1.1b-0.8 -lcrypto -L../magic_file/src/.libs -lmagic
 fuse_overlayfs_SOURCES = main.c direct.c utils.c plugin-manager.c
 
 WD := $(shell pwd)
