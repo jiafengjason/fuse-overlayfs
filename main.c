@@ -151,6 +151,8 @@ static char gMntNs[128] = {0};
 struct ovl_node *g_basefs_root;
 
 
+int ends_suffix(const char *str, const char *suffix);
+
 static void pid_mnt_ns(pid_t pid, char *mnt_ns, int len)
 {
     char *path;
@@ -1263,6 +1265,7 @@ static int checkAuthority(fuse_req_t req, fuse_ino_t ino)
     int fpid = 0;
     bool flag = false;
 
+
     static box_decison_t cache_dicison = {-1, false};
 
     if (UNLIKELY (ovl_debug (req)))
@@ -1303,7 +1306,7 @@ int checkPath(struct ovl_data *lo, char *path)
     dirc = strdup(lo->mountpoint);
     dname = dirname(dirc);
 
-    if (0 == strcmp(path, dname+1)) {
+    if (0 == strcmp(path, dname+1) || ends_suffix(path, dname)) {
         fprintf(stderr, "CheckPath deny, path=%s\n", path);
         //syslog(LOG_INFO, "CheckPath deny, path=%s\n", path);
         return 0;
