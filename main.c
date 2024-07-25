@@ -2705,6 +2705,10 @@ static int hide_lowlayer_path(char *path, char *name, bool debug)
         return 0;
     }
 
+    if (strcmp(full_path, "/usr/local/etc/inject.config") == 0) {
+        return 0;
+    }
+
     if (strncmp(full_path, "/usr/share", strlen("/usr/share")) == 0) {
         if (strncmp(full_path, "/usr/share/mime", strlen("/usr/share/mime")) == 0) {
             if (strcmp(name, "aliases") == 0
