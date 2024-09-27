@@ -2697,6 +2697,13 @@ static int hide_lowlayer_path(char *path, char *name, bool debug)
         return 0;
     }
 
+    if (strncmp(full_path, "/usr/lib/mips64el-linux-gnu/gtk-2.0/2.10.0/immodules.cache", strlen("/usr/lib/mips64el-linux-gnu/gtk-2.0/2.10.0/immodules.cache")) == 0) {
+        return 0;
+    }
+    if (strncmp(full_path, "/usr/lib/mips64el-linux-gnu/gio/modules/giomodule.cache", strlen("/usr/lib/mips64el-linux-gnu/gio/modules/giomodule.cache")) == 0) {
+        return 0;
+    }
+
     if (strcmp(full_path, "/usr/share/glib-2.0/schemas/gschemas.compiled") == 0) {
         return 0;
     }
