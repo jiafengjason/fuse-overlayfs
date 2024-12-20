@@ -2729,6 +2729,13 @@ static int hide_lowlayer_path(char *path, char *name, bool debug)
         return 0;
     }
 
+    if (strncmp(full_path, "/usr/lib/mips64el-linux-gnuabi64/gtk-2.0/2.10.0/immodules.cache", strlen("/usr/lib/mips64el-linux-gnuabi64/gtk-2.0/2.10.0/immodules.cache")) == 0) {
+        return 0;
+    }
+    if (strncmp(full_path, "/usr/lib/mips64el-linux-gnuabi64/gio/modules/giomodule.cache", strlen("/usr/lib/mips64el-linux-gnuabi64/gio/modules/giomodule.cache")) == 0) {
+        return 0;
+    }
+
     if (strncmp(full_path, "/var/run/NetworkManager/resolv.conf", strlen("/var/run/NetworkManager/resolv.conf")) == 0) {
         return 0;
     }
