@@ -2608,6 +2608,7 @@ static bool magic_file_pass_check(const char* path, bool debug)
     if(!g_magic_ctx)
     {
         syslog(LOG_ERR, "magic_file_pass_check g_magic_ctx is null!");
+        return false;
     }
     bool bret = false;
     ProfileEntry *entry = NULL;
