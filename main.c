@@ -174,7 +174,7 @@ static char gMntNs[128] = {0};
 
 #define BASE_FILE_PATH "/var/lib/dpkg/info/"
 struct ovl_node *g_basefs_root;
-magic_t ctx = NULL;
+magic_t g_magic_ctx = NULL;
 
 int ends_suffix(const char *str, const char *suffix);
 
@@ -2588,29 +2588,33 @@ static bool is_regular_file(char *path)
 static void magic_file_init()
 {
     const char* mgc_file = "/home/jailbox/magic.mgc";
-    ctx = magic_open(MAGIC_MIME);
-    if (NULL == ctx)
+    g_magic_ctx = magic_open(MAGIC_MIME);
+    if (NULL == g_magic_ctx)
     {
         syslog(LOG_INFO, "magic_file_init magic_open failed\n");
         return;
     }
-    if (magic_load(ctx, mgc_file) != 0)
+    if (magic_load(g_magic_ctx, mgc_file) != 0)
     {
         syslog(LOG_INFO, "magic_file_init magic_load %s failed.\n", mgc_file);
-        magic_close(ctx);
-        ctx = NULL;
+        magic_close(g_magic_ctx);
+        g_magic_ctx = NULL;
     }
     return;
 }
 
 static bool magic_file_pass_check(const char* path, bool debug)
 {
+    if(!g_magic_ctx)
+    {
+        syslog(LOG_ERR, "magic_file_pass_check g_magic_ctx is null!");
+    }
     bool bret = false;
     ProfileEntry *entry = NULL;
-    const char* mime_desc = magic_file(ctx, path);
+    const char* mime_desc = magic_file(g_magic_ctx, path);
     if(NULL == mime_desc)
     {
-        syslog(LOG_INFO, "magic_file_pass_check magic_file %s failed.\n", path);
+        syslog(LOG_ERR, "magic_file_pass_check magic_file %s failed.", path);
         return false;
     }
     entry = mimelist;
@@ -2621,7 +2625,7 @@ static bool magic_file_pass_check(const char* path, bool debug)
             bret = true;
             if(debug)
             {
-                syslog(LOG_INFO, "magic_file_pass_check  path=%s\n", path);
+                syslog(LOG_ERR, "magic_file_pass_check  path=%s", path);
             }
             break;
         }
@@ -8346,8 +8350,11 @@ err_out1:
 
   OPENSSL_free(gSSLKey.buffer);
   HMAC_CTX_free(gSSLKey.mac_ctx);
-  magic_close(ctx);
-  ctx = NULL;
+  if(g_magic_ctx)
+  {
+    magic_close(g_magic_ctx);
+    g_magic_ctx = NULL;
+  }
 
   exit (ret ? EXIT_FAILURE : EXIT_SUCCESS);
   return 1;
