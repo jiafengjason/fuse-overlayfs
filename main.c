@@ -174,7 +174,7 @@ static char gMntNs[128] = {0};
 
 #define BASE_FILE_PATH "/var/lib/dpkg/info/"
 struct ovl_node *g_basefs_root;
-
+magic_t ctx = NULL;
 
 int ends_suffix(const char *str, const char *suffix);
 
@@ -2585,28 +2585,33 @@ static bool is_regular_file(char *path)
 	}
 }
 
-static bool magic_file_pass(const char* path, bool debug)
+static void magic_file_init()
 {
     const char* mgc_file = "/home/jailbox/magic.mgc";
-    char* pch = NULL;
-    bool bret = false;
-    ProfileEntry *entry = NULL;
-    magic_t ctx = magic_open(MAGIC_MIME);
+    ctx = magic_open(MAGIC_MIME);
     if (NULL == ctx)
     {
-        syslog(LOG_INFO, "magic_file_pass magic_open failed\n");
-        goto _out;
+        syslog(LOG_INFO, "magic_file_init magic_open failed\n");
+        return;
     }
     if (magic_load(ctx, mgc_file) != 0)
     {
-        syslog(LOG_INFO, "magic_file_pass magic_load %s failed.\n", mgc_file);
-        goto _out;
+        syslog(LOG_INFO, "magic_file_init magic_load %s failed.\n", mgc_file);
+        magic_close(ctx);
+        ctx = NULL;
     }
+    return;
+}
+
+static bool magic_file_pass_check(const char* path, bool debug)
+{
+    bool bret = false;
+    ProfileEntry *entry = NULL;
     const char* mime_desc = magic_file(ctx, path);
     if(NULL == mime_desc)
     {
-        syslog(LOG_INFO, "magic_file_pass magic_file %s failed.\n", path);
-        goto _out;
+        syslog(LOG_INFO, "magic_file_pass_check magic_file %s failed.\n", path);
+        return false;
     }
     entry = mimelist;
     while (entry)
@@ -2616,20 +2621,13 @@ static bool magic_file_pass(const char* path, bool debug)
             bret = true;
             if(debug)
             {
-                syslog(LOG_INFO, "magic_file_pass  path=%s\n", path);
+                syslog(LOG_INFO, "magic_file_pass_check  path=%s\n", path);
             }
             break;
         }
         entry = entry->next;
     }
-
-_out:
-   if (ctx != NULL)
-   {
-        magic_close(ctx);
-        ctx = NULL;
-   }
-   return bret;
+    return bret;
 }
 
 static int hide_lowlayer_path(char *path, char *name, bool debug)
@@ -2800,7 +2798,7 @@ static int hide_lowlayer_path(char *path, char *name, bool debug)
             return 0;
         }
     }
-    if(magic_file_pass(full_path, debug))
+    if(magic_file_pass_check(full_path, debug))
     {
         return 0;
     }
@@ -8105,6 +8103,7 @@ int main (int argc, char *argv[])
   parse_mergelist();
   parse_mimelist();
   basefs_init();
+  magic_file_init();
 
   memset (&opts, 0, sizeof (opts));
   if (fuse_opt_parse (&args, &lo, ovl_opts, fuse_opt_proc) == -1)
@@ -8347,6 +8346,8 @@ err_out1:
 
   OPENSSL_free(gSSLKey.buffer);
   HMAC_CTX_free(gSSLKey.mac_ctx);
+  magic_close(ctx);
+  ctx = NULL;
 
   exit (ret ? EXIT_FAILURE : EXIT_SUCCESS);
   return 1;
