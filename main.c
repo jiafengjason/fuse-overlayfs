@@ -146,6 +146,7 @@ ProfileEntry *blacklist;
 ProfileEntry *mergewhitelist;
 ProfileEntry *mergelist;
 ProfileEntry *mimelist;
+ProfileEntry *applist;
 
 struct fuse_session *g_fuse_se = NULL;
 
@@ -174,9 +175,12 @@ static char gMntNs[128] = {0};
 
 #define BASE_FILE_PATH "/var/lib/dpkg/info/"
 struct ovl_node *g_basefs_root;
+struct ovl_node *g_whitelist_root;
+
 magic_t g_magic_ctx = NULL;
 
 int ends_suffix(const char *str, const char *suffix);
+static bool app_pass_check(const char* appname);
 
 static void pid_mnt_ns(pid_t pid, char *mnt_ns, int len)
 {
@@ -1192,7 +1196,8 @@ int isInBox(fuse_req_t req, pid_t accessPid)
         free(comm);
     
         pid_mnt_ns(accessPid, accessprocMntNs, 128);
-        //syslog(LOG_INFO, "accessPid:%d, accessprocName=%s, accessMntns=%s\n", accessPid, accessprocName, accessprocMntNs);
+        if (UNLIKELY (ovl_debug (req)))
+            syslog(LOG_INFO, "accessPid:%d, accessprocName=%s, accessMntns=%s\n", accessPid, accessprocName, accessprocMntNs);
 	if (strcmp(gMntNs, accessprocMntNs) != 0) {
 		return true;
 	}
@@ -1206,7 +1211,6 @@ int isInBox(fuse_req_t req, pid_t accessPid)
     pid = get_process_id_from_thread_id(accessPid);
 
     if (pid == -1) {        
-        if (UNLIKELY (ovl_debug (req)))
             syslog(LOG_INFO, "failed get processid by id[%d]\n", accessPid);
         return false;
     }
@@ -1270,6 +1274,11 @@ int isInBox(fuse_req_t req, pid_t accessPid)
         }
 
         if(strncmp(procName, "uebm", strlen("uebm"))==0)
+        {
+            return true;
+        }
+
+        if(app_pass_check(procName))
         {
             return true;
         }
@@ -1976,7 +1985,7 @@ make_whiteout_node (const char *path, const char *name)
 }
 
 static struct ovl_node *
-make_basefs_node (const char *path, const char *name)
+make_search_node (const char *path, const char *name)
 {
   cleanup_node_init struct ovl_node *ret = NULL;
   struct ovl_node *ret_xchg;
@@ -2390,9 +2399,9 @@ void profile_add_globlist(char *str, ProfileEntry **list) {
     glob_t globbuf;
     char *path = NULL;
 
-    int globerr = glob(str, GLOB_NOCHECK | GLOB_NOSORT | GLOB_PERIOD, NULL, &globbuf);
+    int globerr = glob(str, GLOB_NOCHECK | GLOB_NOSORT | GLOB_PERIOD | GLOB_BRACE , NULL, &globbuf);
     if (globerr) {
-        printf("Error: failed to glob pattern %s\n", str);
+	syslog(LOG_INFO, "Error: failed to glob pattern %s\n", str);
         return;
     }
 
@@ -2408,6 +2417,50 @@ void profile_add_globlist(char *str, ProfileEntry **list) {
     }
 
     globfree(&globbuf);
+}
+
+void profile_add_recurse_globlist(char *str, ProfileEntry **list, int depth) {
+    char tmpstr[4096] = {0};
+    char *p = NULL;
+    DIR *dir;
+    struct dirent *entry;
+    struct stat statbuf;
+    char fullpath[4096];
+    char prefix_path[4096];
+
+    if (depth > 9) {
+        return;
+    }
+
+    p = strstr(str, "**/");
+    if (p != NULL) {
+        snprintf(tmpstr, 4096, "%.*s%s", p - str, str, p+3);
+        profile_add_globlist(tmpstr, list);
+
+        snprintf(prefix_path, 4096, "%.*s", p - str, str);
+        if ((dir = opendir(prefix_path)) == NULL) {
+            return;
+        }
+
+        while ((entry = readdir(dir)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            snprintf(fullpath, sizeof(fullpath), "%s%s", prefix_path, entry->d_name);
+            if (stat(fullpath, &statbuf) < 0) {
+                continue;
+            } else if (S_ISDIR(statbuf.st_mode)) {
+                snprintf(tmpstr, 4096, "%s/%s", fullpath, p);
+		syslog(LOG_INFO, "recurse glob pattern %s\n", tmpstr);
+                profile_add_recurse_globlist(tmpstr, list, depth+1);
+            }
+        }
+        closedir(dir);
+
+    } else {
+        profile_add_globlist(str, list);
+    }
+
 }
 
 void profile_mergelist(ProfileEntry **includelist, ProfileEntry **excludelist, ProfileEntry **mergelist) {
@@ -2521,7 +2574,7 @@ void parse_mergelist() {
         if (strncmp(ptr, "whitelist ", 10) == 0) {
             new_name = expand_macros(ptr+10);
             if (new_name) {
-                profile_add_globlist(new_name, &whitelist);
+                profile_add_recurse_globlist(new_name, &whitelist, 0);
             }
         } else if (strncmp(ptr, "nowhitelist ", 12) == 0) {
             new_name = expand_macros(ptr+12);
@@ -2531,8 +2584,10 @@ void parse_mergelist() {
         } else if (strncmp(ptr, "blacklist ", 10) == 0) {
             new_name = expand_macros(ptr+10);
             if (new_name) {
-                profile_add_globlist(new_name, &blacklist);
+                profile_add_recurse_globlist(new_name, &blacklist, 0);
             }
+        } else if (strncmp(ptr, "applist ", 8) == 0) {
+            profile_add_list(ptr+8, &applist);
         }
         if (new_name)
             free(new_name);
@@ -2583,6 +2638,27 @@ static bool is_regular_file(char *path)
 	} else {
         return 0;
 	}
+}
+
+static bool app_pass_check(const char* appname)
+{
+    bool bret = false;
+    ProfileEntry *entry = NULL;
+
+    entry = applist;
+    while (entry)
+    {
+
+        syslog(LOG_INFO, "check app %s, len %d name %s, len %d ret %d\n", appname, strlen(appname), entry->data, strlen(entry->data), strcmp(appname, entry->data));
+        if (strcmp(appname, entry->data) == 0)
+        {
+            bret = true;
+            break;
+        }
+        entry = entry->next;
+    }
+
+    return bret;
 }
 
 static void magic_file_init()
@@ -2711,6 +2787,14 @@ static int hide_lowlayer_path(char *path, char *name, bool debug)
         return 0;
     }
 
+    child = hash_lookup (g_whitelist_root->children, &key);
+    
+    if (child)
+    {
+        return 0;
+    } 
+
+ /*
     if (os != NULL && (0 == strncmp(os, "deepin", strlen("deepin")) || 0 == strncmp(os, "ukui", strlen("ukui")) || 0 == strncmp(os, "mate", strlen("mate"))))
     {
         if (strncmp(full_path, "/etc/machine-id", strlen("/etc/machine-id")) == 0) {
@@ -2755,6 +2839,14 @@ static int hide_lowlayer_path(char *path, char *name, bool debug)
         return 0;
     }
 
+    if (strncmp(full_path, "/usr/lib/x86_64-linux-gnu/", strlen("/usr/lib/x86_64-linux-gnu/")) == 0) {
+        if (ends_suffix(name, ".pyc") || ends_suffix(name, "__pycache__")
+            || ends_suffix(name, ".cache")) {
+            return 0;
+        }
+    }
+
+ */
     if (strncmp(full_path, "/usr/share", strlen("/usr/share")) == 0) {
         if (strncmp(full_path, "/usr/share/mime", strlen("/usr/share/mime")) == 0) {
             if (strcmp(name, "aliases") == 0
@@ -2776,9 +2868,9 @@ static int hide_lowlayer_path(char *path, char *name, bool debug)
                 return 0;
             }
             
-            if (ends_suffix(name, ".xml")) {
-                return 0;
-            }
+            //if (ends_suffix(name, ".xml")) {
+            //    return 0;
+            //}
         }
 
         /*
@@ -2797,12 +2889,6 @@ static int hide_lowlayer_path(char *path, char *name, bool debug)
         }
     }
 
-    if (strncmp(full_path, "/usr/lib/x86_64-linux-gnu/", strlen("/usr/lib/x86_64-linux-gnu/")) == 0) {
-        if (ends_suffix(name, ".pyc") || ends_suffix(name, "__pycache__")
-            || ends_suffix(name, ".cache")) {
-            return 0;
-        }
-    }
     if(magic_file_pass_check(full_path, debug))
     {
         return 0;
@@ -7976,7 +8062,7 @@ static void  parent_exit_watch()
 
 static void basefs_root_init()
 {
-    g_basefs_root = make_basefs_node ("/", "/");
+    g_basefs_root = make_search_node ("/", "/");
     if (g_basefs_root == NULL) {
         error (EXIT_FAILURE, 0, "error basefs_root init");
     }
@@ -7984,6 +8070,39 @@ static void basefs_root_init()
     g_basefs_root->children = hash_initialize (1<<17, NULL, node_hasher, node_compare, node_free);
     if (g_basefs_root->children == NULL) {
         error (EXIT_FAILURE, 0, "error basefs_root children init");
+    }
+}
+
+
+static void whitelist_root_init()
+{
+    g_whitelist_root = make_search_node ("/", "/");
+    if (g_whitelist_root == NULL) {
+        error (EXIT_FAILURE, 0, "error whitelist_root init");
+    }
+    
+    g_whitelist_root->children = hash_initialize (1<<17, NULL, node_hasher, node_compare, node_free);
+    if (g_whitelist_root->children == NULL) {
+        error (EXIT_FAILURE, 0, "error whitelist_root children init");
+    }
+}
+
+static void load_whitelist_item() {
+    whitelist_root_init();
+    struct ovl_node *node;
+
+    ProfileEntry *entry = NULL;
+    syslog(LOG_INFO, "load_whitelist_item mergewhitelist\n");
+    entry = mergewhitelist;
+    while (entry) {
+	syslog(LOG_INFO, "mergewhitelist %s\n", entry->data);
+        node = make_search_node ("", entry->data);
+        if (node != NULL)
+        {
+            insert_node (g_whitelist_root, node, false);
+        }
+
+        entry = entry->next;
     }
 }
 
@@ -8016,7 +8135,7 @@ static void load_detail_item(char *path) {
             continue;
         }
 
-        node = make_basefs_node ("", ptr);
+        node = make_search_node ("", ptr);
         if (node == NULL)
         {
             continue;
@@ -8106,6 +8225,7 @@ int main (int argc, char *argv[])
   }
   newKey(password, strlen(password), gSSLCipher.keySize, gSSLCipher.ivLength);
   parse_mergelist();
+  load_whitelist_item();
   parse_mimelist();
   basefs_init();
   magic_file_init();
