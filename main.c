@@ -2451,7 +2451,7 @@ void profile_add_recurse_globlist(char *str, ProfileEntry **list, int depth) {
                 continue;
             } else if (S_ISDIR(statbuf.st_mode)) {
                 snprintf(tmpstr, 4096, "%s/%s", fullpath, p);
-		syslog(LOG_INFO, "recurse glob pattern %s\n", tmpstr);
+		//syslog(LOG_INFO, "recurse glob pattern %s\n", tmpstr);
                 profile_add_recurse_globlist(tmpstr, list, depth+1);
             }
         }
@@ -2587,7 +2587,7 @@ void parse_mergelist() {
                 profile_add_recurse_globlist(new_name, &blacklist, 0);
             }
         } else if (strncmp(ptr, "applist ", 8) == 0) {
-            profile_add_list(ptr+8, &applist);
+            profile_add_list(strdup(ptr+8), &applist);
         }
         if (new_name)
             free(new_name);
@@ -8095,7 +8095,7 @@ static void load_whitelist_item() {
     syslog(LOG_INFO, "load_whitelist_item mergewhitelist\n");
     entry = mergewhitelist;
     while (entry) {
-	syslog(LOG_INFO, "mergewhitelist %s\n", entry->data);
+	//syslog(LOG_INFO, "mergewhitelist %s\n", entry->data);
         node = make_search_node ("", entry->data);
         if (node != NULL)
         {
