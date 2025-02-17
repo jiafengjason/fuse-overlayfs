@@ -1211,7 +1211,7 @@ int isInBox(fuse_req_t req, pid_t accessPid)
     pid = get_process_id_from_thread_id(accessPid);
 
     if (pid == -1) {        
-            syslog(LOG_INFO, "failed get processid by id[%d]\n", accessPid);
+        syslog(LOG_INFO, "failed get processid by id[%d]\n", accessPid);
         return false;
     }
 
@@ -2589,8 +2589,10 @@ void parse_mergelist() {
         } else if (strncmp(ptr, "applist ", 8) == 0) {
             profile_add_list(strdup(ptr+8), &applist);
         }
-        if (new_name)
+        if (new_name) {
             free(new_name);
+	    new_name = NULL;
+	}
     }
 
     fclose(fp);
