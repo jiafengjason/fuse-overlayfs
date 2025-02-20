@@ -9,7 +9,7 @@ EXTRA_DIST = m4/gnulib-cache.m4 rpm/fuse-overlayfs.spec.template autogen.sh fuse
 AM_CPPFLAGS = -DPKGLIBEXECDIR='"$(pkglibexecdir)"'
 
 fuse_overlayfs_CFLAGS = -I . -I $(abs_srcdir)/lib -I ../magic_file/src $(FUSE_CFLAGS)
-fuse_overlayfs_LDFLAGS = -Wl,-rpath,$$ORIGIN/opt/apps/top.enlink.enues/files/uebm/coms/EnDeskTop/lib:$$ORIGIN/home/enlink/lib
+fuse_overlayfs_LDFLAGS = -Wl,-rpath,$$ORIGIN/opt/apps/top.enlink.enues/files/uebm/coms/EnDeskTop/lib:$$ORIGIN/opt/apps/top.enlink.enues/files/uebm/coms/EnDeskTop/box/lib
 fuse_overlayfs_LDADD = lib/libgnu.a $(FUSE_LIBS) -lcrypto -L../magic_file/src/.libs -lmagic
 fuse_overlayfs_SOURCES = main.c direct.c utils.c plugin-manager.c
 
