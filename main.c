@@ -2465,7 +2465,7 @@ char *expand_macros(char *path) {
 
 void parse_mimelist()
 {
-    FILE *fp = fopen("/home/jailbox/mime.config", "r");
+    FILE *fp = fopen("/opt/apps/top.enlink.enues/files/uebm/coms/EnDeskTop/box/etc/mime.config", "r");
     char line[MAX_MIME_LEN + 1] = {0};
     char *ptr = NULL;
     if (fp == NULL) 
@@ -2500,7 +2500,7 @@ void parse_mergelist() {
     char *ptr = NULL;
     char *new_name = NULL;
 
-    FILE *fp = fopen("/home/jailbox/profile.config", "r");
+    FILE *fp = fopen("/opt/apps/top.enlink.enues/files/uebm/coms/EnDeskTop/box/etc/profile.config", "r");
     if (fp == NULL) {
         syslog(LOG_INFO,"Error: cannot open profile file %s\n", "profile.config");
         return;
@@ -2587,7 +2587,7 @@ static bool is_regular_file(char *path)
 
 static void magic_file_init()
 {
-    const char* mgc_file = "/home/jailbox/magic.mgc";
+    const char* mgc_file = "/opt/apps/top.enlink.enues/files/uebm/coms/EnDeskTop/box/etc/magic.mgc";
     g_magic_ctx = magic_open(MAGIC_MIME);
     if (NULL == g_magic_ctx)
     {
