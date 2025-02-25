@@ -2766,6 +2766,13 @@ static int hide_lowlayer_path(char *path, char *name, bool debug)
     {
         return 0;
     }
+
+    child = hash_lookup (g_whitelist_root->children, &key);
+    
+    if (child)
+    {
+        return 0;
+    } 
     
     if (strncmp(full_path, "/usr/bin", strlen("/usr/bin")) == 0
         || strncmp(full_path, "/usr/lib", strlen("/usr/lib")) == 0 
