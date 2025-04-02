@@ -8448,6 +8448,7 @@ int main (int argc, char *argv[])
       error (0, errno, "cannot mount");
       goto err_out3;
     }
+  fprintf (stderr, "fuse-overlayfs mount success");
   fuse_daemonize (opts.foreground);
 
   if (lo.threaded)
