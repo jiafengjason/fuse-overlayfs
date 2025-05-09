@@ -2651,7 +2651,7 @@ static bool app_pass_check(const char* appname)
     while (entry)
     {
 
-        syslog(LOG_INFO, "check app %s, len %d name %s, len %d ret %d\n", appname, strlen(appname), entry->data, strlen(entry->data), strcmp(appname, entry->data));
+        // syslog(LOG_INFO, "check app %s, len %d name %s, len %d ret %d\n", appname, strlen(appname), entry->data, strlen(entry->data), strcmp(appname, entry->data));
         if (strcmp(appname, entry->data) == 0)
         {
             bret = true;
